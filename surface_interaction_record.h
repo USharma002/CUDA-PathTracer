@@ -7,13 +7,14 @@
 class surface_interaction_record
 {
 public:
-    __host__ __device__ surface_interaction_record() : hit(false){}
+    __host__ __device__ surface_interaction_record() : hit(false), Le(vec3(0, 0, 0)) {}
 
     bool hit;
     
-    vec3 normal;
-    vec3 position;
+    vec3 n;
+    vec3 p;
     vec3 bsdf;
+    vec3 Le;
 
     float t;
 };

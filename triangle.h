@@ -3,17 +3,21 @@
 
 #include "vec3.h"
 #include "ray.h"
+#include "surface_interaction_record.h"
 
 class triangle
 {
 public:
     __host__ __device__ triangle() {}
 
-    __host__ __device__ triangle(const vec3& _v0, const vec3& _v1, const vec3& _v2)
-        : v0(_v0), v1(_v1), v2(_v2) {}
+    __host__ __device__ triangle(const vec3& _v0, const vec3& _v1, const vec3& _v2, const vec3& _bsdf = vec3(0.3f, 0.2f, 0.3f))
+        : v0(_v0), v1(_v1), v2(_v2), bsdf(_bsdf){}
+
+    __host__ __device__ triangle(const vec3& _v0, const vec3& _v1, const vec3& _v2, const vec3& _bsdf, const vec3& _normal)
+    : v0(_v0), v1(_v1), v2(_v2), bsdf(_bsdf), normal(_normal) {}
 
     // Return intersection point if hit, else return vec3(-1, -1, -1)
-    __device__ bool intersect(const ray& r) const
+    __device__ bool intersect(const ray& r, surface_interaction_record &si) const
     {
         const float EPSILON = 1e-8f;
 
@@ -43,8 +47,16 @@ public:
 
         if (t > EPSILON)
         {
+            si.t = t;
+            si.hit = true;
+            si.n = normal;
+            si.bsdf = bsdf;
+            si.Le = Le;
+            si.p = r.origin() + t * r.direction();
+
             // Compute intersection point
-            return true;        }
+            return true;        
+        }
 
         return false;  // No hit (line intersects behind ray origin).
     }
@@ -52,6 +64,9 @@ public:
     vec3 v0;
     vec3 v1;
     vec3 v2;
+    vec3 bsdf;
+    vec3 normal;
+    vec3 Le;
 };
 
 #endif
