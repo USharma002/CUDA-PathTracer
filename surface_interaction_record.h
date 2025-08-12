@@ -9,14 +9,14 @@ class surface_interaction_record
 public:
     __host__ __device__ surface_interaction_record() : hit(false), Le(vec3(0, 0, 0)) {}
 
-    bool hit;
+    bool hit; // did we hit a surface?
     
-    vec3 n;
-    vec3 p;
-    vec3 bsdf;
-    vec3 Le;
+    vec3 n; // Shading Normal 
+    vec3 p; // position of intersection
+    vec3 bsdf; // bsdf of intersected surface
+    vec3 Le; // Emitted Light
 
-    float t;
+    float t; // distance
 };
 
 #endif

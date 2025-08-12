@@ -1,39 +1,46 @@
 #ifndef FILE_MANAGER_H
 #define FILE_MANAGER_H
 
-#include <map> // Add this include for std::map
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <vector>
+#include <string>
+#include <map>
+#include <algorithm>
+#include <cuda_runtime.h>
 
 #include "vec3.h"
 #include "triangle.h"
 
-vec3 computeNormal(const vec3& a, const vec3& b, const vec3& c) {
-    return unit_vector(cross(b - a, c - a));
-}
-
-// limited version of checkCudaErrors from helper_cuda.h in CUDA examples
-#define checkCudaErrors(val) check_cuda( (val), #val, __FILE__, __LINE__ )
-
-void check_cuda(cudaError_t result, char const *const func, const char *const file, int const line) {
-    if (result) {
-        std::cerr << "CUDA error = " << static_cast<unsigned int>(result) << " at " <<
-            file << ":" << line << " '" << func << "' \n";
-        // Make sure we call CUDA Device Reset before exiting
-        cudaDeviceReset();
-        exit(99);
-    }
-}
+// By marking all functions in this header as 'static', we are telling the compiler
+// to create a private copy for each .cpp file that includes it. This completely
+// avoids the "multiple definition" linker errors that normally happen when you
+// put function bodies in a header file.
 
 // A simple struct to hold material properties read from the MTL file
 struct Material {
     vec3 bsdf = vec3(0.8f, 0.8f, 0.8f); // Default to white
-    vec3 Le = vec3(0.0f, 0.0f, 0.0f);   // Default to no emission
+    vec3 Le   = vec3(0.0f, 0.0f, 0.0f);   // Default to no emission
 };
-// Parses a .mtl file and returns a map of material names to Material properties.
-std::map<std::string, Material> loadMTL(const std::string& filename) {
+
+static void check_cuda(cudaError_t result, char const *const func, const char *const file, int const line) {
+    if (result) {
+        std::cerr << "CUDA error = " << static_cast<unsigned int>(result) << " at " <<
+            file << ":" << line << " '" << func << "' \n";
+        cudaDeviceReset();
+        exit(99);
+    }
+}
+#define checkCudaErrors(val) check_cuda( (val), #val, __FILE__, __LINE__ )
+
+
+// Marked static to keep it private to this file's scope.
+static std::map<std::string, Material> loadMTL(const std::string& filename) {
     std::map<std::string, Material> materials;
     std::ifstream file(filename);
     if (!file.is_open()) {
-        std::cerr << "Cannot open MTL file: " << filename << std::endl;
+        std::cerr << "Warning: Could not open MTL file: " << filename << std::endl;
         return materials;
     }
 
@@ -47,12 +54,11 @@ std::map<std::string, Material> loadMTL(const std::string& filename) {
         iss >> prefix;
 
         if (prefix == "newmtl") {
-            // If we were already building a material, save it before starting a new one.
             if (!current_material_name.empty()) {
                 materials[current_material_name] = current_material;
             }
             iss >> current_material_name;
-            current_material = Material(); // Reset for the new material
+            current_material = Material();
         } else if (prefix == "Kd") { // Diffuse color
             float r, g, b;
             iss >> r >> g >> b;
@@ -64,23 +70,21 @@ std::map<std::string, Material> loadMTL(const std::string& filename) {
         }
     }
 
-    // Save the last material in the file
     if (!current_material_name.empty()) {
         materials[current_material_name] = current_material;
     }
 
+    std::cout << "Loaded " << materials.size() << " materials from " << filename << std::endl;
     return materials;
 }
 
-// An updated OBJ loader that also parses material files (.mtl)
-bool loadOBJ(const std::string& obj_filename, triangle** h_list_out, int& num_triangles_out) {
+static bool loadOBJ(const std::string& obj_filename, triangle** h_list_out, int& num_triangles_out) {
     std::ifstream file(obj_filename);
     if (!file.is_open()) {
-        std::cerr << "Cannot open OBJ file: " << obj_filename << "\n";
+        std::cerr << "Error: Cannot open OBJ file: " << obj_filename << "\n";
         return false;
     }
 
-    // Extract path from filename to find the MTL file
     std::string path_base = "";
     size_t last_slash = obj_filename.find_last_of("/\\");
     if (last_slash != std::string::npos) {
@@ -95,20 +99,29 @@ bool loadOBJ(const std::string& obj_filename, triangle** h_list_out, int& num_tr
     Material current_material;
 
     std::string line;
+    int line_num = 0;
     while (std::getline(file, line)) {
-        if (line.empty()) continue;
+        line_num++;
+        if (line.empty() || line[0] == '#') continue;
+
         std::istringstream iss(line);
         std::string prefix;
         iss >> prefix;
 
         if (prefix == "v") {
             float x, y, z;
-            iss >> x >> y >> z;
+            if (!(iss >> x >> y >> z)) {
+                std::cerr << "Warning on line " << line_num << ": Malformed vertex data." << std::endl;
+                continue;
+            }
             vertices.emplace_back(x, y, z);
         } else if (prefix == "vn") {
             float nx, ny, nz;
-            iss >> nx >> ny >> nz;
-            normals.emplace_back(nx, ny, nz);
+            if (!(iss >> nx >> ny >> nz)) {
+                 std::cerr << "Warning on line " << line_num << ": Malformed normal data." << std::endl;
+                continue;
+            }
+            normals.emplace_back(unit_vector(vec3(nx, ny, nz)));
         } else if (prefix == "mtllib") {
             std::string mtl_filename;
             iss >> mtl_filename;
@@ -123,59 +136,80 @@ bool loadOBJ(const std::string& obj_filename, triangle** h_list_out, int& num_tr
                 current_material = Material();
             }
         } else if (prefix == "f") {
-            std::string face_data = line.substr(line.find(" ") + 1);
-            std::replace(face_data.begin(), face_data.end(), '/', ' ');
-            std::istringstream fss(face_data);
+            std::vector<size_t> v_idx(3), n_idx(3);
 
-            int v_idx[3], n_idx[3] = {-1, -1, -1};
-            int dummy_vt; // To consume texture coord indices if they exist
+            for (int i = 0; i < 3; ++i) {
+                std::string token;
+                iss >> token;  // Example: "2//1" or "2/5/1" or "2/5" or "2"
 
-            for(int i = 0; i < 3; ++i) {
-                fss >> v_idx[i];
-                if (fss.peek() == ' ') {
-                    fss.ignore();
-                    if(fss.peek() == ' '){ // Format is v//n
-                        fss.ignore();
-                        fss >> n_idx[i];
-                    } else { // Format is v/vt or v/vt/n
-                        fss >> dummy_vt;
-                        if(fss.peek() == ' '){
-                            fss.ignore();
-                            fss >> n_idx[i];
+                size_t v = 0, vt = 0, vn = 0;
+                char slash;
+
+                std::stringstream tokenStream(token);
+
+                if (!(tokenStream >> v)) {
+                    std::cerr << "Warning on line " << line_num << ": malformed face vertex token '" << token << "'.\n";
+                    v = 0;
+                }
+
+                if (tokenStream.peek() == '/') {
+                    tokenStream >> slash; // consume first slash
+
+                    if (tokenStream.peek() == '/') {
+                        tokenStream >> slash; // consume second slash
+                        tokenStream >> vn;    // v//vn format
+                    } else {
+                        tokenStream >> vt; // read vt
+                        if (tokenStream.peek() == '/') {
+                            tokenStream >> slash;
+                            tokenStream >> vn; // v/vt/vn format
                         }
                     }
                 }
+
+                v_idx[i] = v;
+                n_idx[i] = vn;
             }
 
+            // Validate vertex indices
+            if (v_idx[0] == 0 || v_idx[1] == 0 || v_idx[2] == 0 ||
+                v_idx[0] > vertices.size() || v_idx[1] > vertices.size() || v_idx[2] > vertices.size()) {
+                std::cerr << "Warning on line " << line_num << ": invalid vertex index.\n";
+                continue;
+            }
+
+            // Retrieve vertices
             vec3 vA = vertices[v_idx[0] - 1];
             vec3 vB = vertices[v_idx[1] - 1];
             vec3 vC = vertices[v_idx[2] - 1];
 
+            // Determine normal
             vec3 tri_normal;
-            if (n_idx[0] != -1) {
-                // Average vertex normals for a smoother look if provided, though face normal is fine.
-                // Here we just use the first vertex normal for the whole face.
-                tri_normal = unit_vector(normals[n_idx[0] - 1]);
+            if (n_idx[0] != 0 && n_idx[0] <= normals.size()) {
+                tri_normal = normals[n_idx[0] - 1];
             } else {
-                tri_normal = computeNormal(vA, vB, vC); // Compute face normal if not provided
+                tri_normal = unit_vector(cross(vB - vA, vC - vA));
             }
 
             triangle tri(vA, vB, vC, current_material.bsdf, tri_normal);
             tri.Le = current_material.Le;
             temp_triangles.push_back(tri);
         }
+
     }
     file.close();
 
+    if (temp_triangles.empty()) {
+        std::cerr << "Error: No valid triangles were loaded from " << obj_filename << std::endl;
+        return false;
+    }
+
     num_triangles_out = static_cast<int>(temp_triangles.size());
     checkCudaErrors(cudaMallocHost(h_list_out, num_triangles_out * sizeof(triangle)));
-
-    // Copy the loaded triangles into the pinned host memory
     memcpy(*h_list_out, temp_triangles.data(), num_triangles_out * sizeof(triangle));
 
-    std::cout << "Loaded " << num_triangles_out << " triangles from " << obj_filename << std::endl;
-
+    std::cout << "Successfully loaded " << num_triangles_out << " triangles from " << obj_filename << std::endl;
     return true;
 };
 
-#endif  // FILE_MANAGER_H
+#endif // FILE_MANAGER_H
