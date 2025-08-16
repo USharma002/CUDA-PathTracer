@@ -12,7 +12,7 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
-#include "vec3.h"
+#include "vector.h"
 #include "ray.h"
 #include "sensor.h"
 #include "triangle.h"
@@ -31,7 +31,7 @@
 int main(int argc, char** argv) {
     int image_width = 2000;
     int image_height = 2000;
-    int spp = 1000;
+    int spp = 10000;
     std::string scene_file = "./scenes/cbox.obj";
 
     if (argc >= 3) {

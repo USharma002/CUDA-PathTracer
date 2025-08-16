@@ -1,7 +1,7 @@
 #ifndef TRIANGLEH
 #define TRIANGLEH
 
-#include "vec3.h"
+#include "vector.h"
 #include "ray.h"
 #include "surface_interaction_record.h"
 

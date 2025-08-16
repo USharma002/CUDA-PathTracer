@@ -1,7 +1,7 @@
 #ifndef SURFACE_INTERACTION_RECORDH
 #define SURFACE_INTERACTION_RECORDH
 
-#include "vec3.h"
+#include "vector.h"
 #include "ray.h"
 
 class SurfaceInteractionRecord

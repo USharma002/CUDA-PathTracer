@@ -2,7 +2,7 @@
 #define CAMERAH
 
 #include "ray.h"
-#include "vec3.h"
+#include "vector.h"
 
 #ifndef M_PI
 #    define M_PI 3.14159265358979323846

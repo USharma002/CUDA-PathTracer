@@ -10,7 +10,7 @@
 #include <algorithm>
 #include <cuda_runtime.h>
 
-#include "vec3.h"
+#include "vector.h"
 #include "triangle.h"
 
 // By marking all functions in this header as 'static', we are telling the compiler
