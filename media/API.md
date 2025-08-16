@@ -1,128 +1,239 @@
-# Rendering Engine Overview
-
-## 🔹 Core Math / Utilities
-**vec3.h**
-
-**Attributes:**  
-- `x, y, z` (float/double)
-
-**Methods:**  
-- Basic operations: `+`, `-`, `*`, `/`  
-- `dot`, `cross`  
-- `length`, `normalize`  
-- Utility: `clamp`, `reflect`, `refract`  
+# Rendering Engine Documentation (CUDA/C++)
 
 ---
 
-## 🔹 Rays & Geometry
-**ray.h**
+## Core Math / Utilities
 
-**Attributes:**  
-- `origin` (`vec3`)  
-- `dir` (`vec3`, normalized)  
-- `tmin`, `tmax` (float)  
+### class `Vector3f`
 
-**Methods:**  
-- `point_at(t)` → returns `origin + t * dir`  
+Represents a 3D vector with basic arithmetic and utility functions.
 
-**surface_interaction_record.h**
+**Constructor:**
 
-**Attributes:**  
-- `p` (hit point)  
-- `n` (shading normal)  
-- `uv` (texture coordinates)  
-- `t` (distance along ray)  
-- `wo` (outgoing direction = `-ray.dir`)  
-- `material / bsdf` (pointer/ref to material at hit)  
+```cpp
+Vector3f(float x, float y, float z);
+```
 
-**Methods:**  
-- `bool is_valid()`  
+**Attributes:**
 
-**triangle.h**
+* `float x` — X component
+* `float y` — Y component
+* `float z` — Z component
 
-**Attributes:**  
-- `v0, v1, v2` (vertices)  
-- `n0, n1, n2` (normals, optional)  
-- `uv0, uv1, uv2`  
-- `material` (pointer to material)  
-- `Le` (emission color, optional)  
+**Methods:**
 
-**Methods:**  
-- `bool intersect(ray, SurfaceInteraction&)`  
-- `get_bounds()` (for BVH)  
-- `sample_point(Sample2D)` (for area light sampling)  
+```cpp
+Vector3f operator+(const Vector3f& other) const;   // Vector addition
+Vector3f operator-(const Vector3f& other) const;   // Vector subtraction
+Vector3f operator*(const Vector3f& other) const;   // Component-wise multiplication
+Vector3f operator/(const Vector3f& other) const;   // Component-wise division
+float dot(const Vector3f& other) const;            // Dot product
+Vector3f cross(const Vector3f& other) const;       // Cross product
+float length() const;                              // Magnitude of the vector
+float length_squared() const;                      // Magnitude square of the vector
+Vector3f normalize() const;                        // Returns normalized vector
+```
 
----
-
-## 🔹 Materials & BSDF
-**material.h** (BSDF abstraction)
-
-**Attributes:**  
-- `Type` (diffuse, mirror, glass…)  
-- Parameters: `albedo`, `roughness`, `ior`, etc.  
-
-**Methods:**  
-- `f(si, wi, wo)` → BSDF value  
-- `sample(si, wo, rng)` → returns sampled `wi`, `pdf`, `f`  
-- `pdf(si, wi, wo)`  
-- `Le(si, wo)` → emitted radiance if emissive  
+<b>TODO</b>
+```
+Vector3f clamp(float min, float max) const;       // Clamps each component
+Vector3f reflect(const Vector3f& normal) const;   // Reflection vector
+Vector3f refract(const Vector3f& normal, float ior) const;  // Refraction vector
+```
 
 ---
 
-## 🔹 Scene & Camera
-**sensor.h** (Camera)
+## Rays & Geometry
 
-**Attributes:**  
-- `pos`, `look_at`, `up`  
-- `fov` (field of view)  
-- `aspect_ratio`  
-- `film` (pixel buffer)  
+### class `Ray`
 
-**Methods:**  
-- `Ray generate_ray(x, y, rng)` → for pixel sample  
+Represents a ray in 3D space.
 
-**scene.h**
+**Constructor:**
 
-**Attributes:**  
-- `std::vector<Triangle> shapes`  
-- `std::vector<Emitter*> emitters`  
-- Acceleration structure (BVH, kd-tree)  
-- Optional environment light  
+```cpp
+Ray(const Vector3f& origin, const Vector3f& dir, float tmin = 0.0f, float tmax = FLT_MAX);
+```
 
-**Methods:**  
-- `bool intersect(ray, SurfaceInteraction&)`  
-- `Emitter* sample_emitter(rng)`  
-- `bool visible(p1, p2)` (shadow ray check)  
+**Attributes:**
 
----
+* `Vector3f o` — Ray origin
+* `Vector3f d` — Normalized direction
+* `float tmin` — Minimum valid distance
+* `float tmax` — Maximum valid distance
 
-## 🔹 Rendering
-**integrator.h**
+**Methods:**
 
-**Attributes:**  
-- `max_depth`  
-- `rr_threshold` (Russian roulette probability)  
-
-**Methods:**  
-- `Li(ray, scene, rng)` → recursively compute radiance  
-- `render(scene, sensor)` → loops over pixels, calls `Li`  
+```cpp
+Vector3f at(float t) const;    // Returns o + t * d
+```
 
 ---
 
-## 🔹 Supporting Infrastructure
-**file_manager.h**
+### class `SurfaceInteraction`
 
-**Attributes:** none  
+Stores information about a ray-surface intersection.
 
-**Methods:**  
-- `load_obj(filepath)` → returns list of triangles + materials  
-- `load_scene(filepath)` → parse scene description  
+**Attributes:**
 
-**stb_image_write.h**  
-- 3rd party header-only library, already included  
+* `Vector3f p` — Hit point
+* `Vector3f n` — Shading normal
+* `float t` — Distance along the ray
+* `Material* material` — Material at intersection
 
-**math_utils.h**  
+**TODO**
+* `Vector2f uv` — Texture coordinates
+* `Vector3f wo` — Outgoing direction (-ray.dir)
 
-**Methods / Utilities:**  
-- Random sampling functions: `sample_hemisphere`, `sample_cosine_hemisphere`, `sample_sphere`  
-- Coordinate transforms: world ↔ local shading frame  
+**Methods:**
+
+```cpp
+bool is_valid() const;   // Returns true if intersection is valid
+```
+
+---
+
+### class `Triangle`
+
+Represents a triangle in 3D space.
+
+**Attributes:**
+
+* `Vector3f v0, v1, v2` — Vertices
+* `Material* material` — Material
+**TODO**
+* `Vector2f uv0, uv1, uv2` — Texture coordinates
+* `Vector3f n0, n1, n2` — Vertex normals (optional)
+
+**Methods:**
+
+```cpp
+bool intersect(const Ray& ray, SurfaceInteraction& si) const;  // Ray-triangle intersection
+```
+**TODO**
+```
+AABB get_bounds() const;                                        // Returns bounding box
+Vector3f sample_point(const Sample2D& sample) const;            // Sample a point on triangle
+```
+
+---
+
+## Materials & BSDF
+
+### class `Material`
+
+Abstract BSDF class.
+
+**Attributes:**
+
+* `enum Type` — Diffuse, Mirror, Glass, etc.
+* `float albedo, roughness, ior` — Material parameters
+
+**Methods:**
+
+```cpp
+Vector3f f(const SurfaceInteraction& si, const Vector3f& wi, const Vector3f& wo) const;   // BSDF evaluation
+Vector3f sample(const SurfaceInteraction& si, const Vector3f& wo, RNG& rng) const;         // Sampled direction and BSDF value
+float pdf(const SurfaceInteraction& si, const Vector3f& wi, const Vector3f& wo) const;      // PDF for given direction
+Vector3f Le(const SurfaceInteraction& si, const Vector3f& wo) const;                        // Emitted radiance
+```
+
+---
+
+## Scene & Camera
+
+### class `Sensor`
+
+Camera class that generates rays for each pixel.
+
+**Attributes:**
+
+* `Vector3f pos, look_at, up` — Camera position and orientation
+* `float fov` — Field of view
+* `float aspect_ratio` — Image aspect ratio
+
+**TODO**
+* `Film film` — Pixel buffer
+
+**Methods:**
+
+```cpp
+Ray generate_ray(float x, float y, RNG& rng) const;   // Generate camera ray for pixel
+```
+
+---
+
+### class `Scene`
+
+Contains geometry, emitters, and acceleration structures.
+
+**Attributes:**
+
+* `std::vector<Triangle> shapes` — Scene geometry
+
+**TODO**
+* `std::vector<Emitter*> emitters` — Light sources
+* `AccelStructure* accel` — Acceleration structure (BVH/kd-tree)
+* `Environment* env_light` — Optional environment light
+
+**Methods:**
+
+```cpp
+bool intersect(const Ray& ray, SurfaceInteraction& si) const;  // Scene intersection
+Emitter* sample_emitter(RNG& rng) const;                        // Random emitter selection
+bool visible(const Vector3f& p1, const Vector3f& p2) const;    // Shadow ray check
+```
+
+---
+
+## Rendering
+
+### class `Integrator`
+
+Path tracing integrator.
+
+**Attributes:**
+
+* `int max_depth` — Maximum recursion depth
+* `float rr_threshold` — Russian roulette probability
+
+**Methods:**
+
+```cpp
+Vector3f Li(const Ray& ray, const Scene& scene, RNG& rng, int depth = 0) const;   // Compute radiance recursively
+void render(const Scene& scene, Sensor& sensor);                                   // Loop over pixels and compute image
+```
+
+---
+
+## Supporting Infrastructure
+
+### class `FileManager`
+
+Loads geometry and scene descriptions.
+
+**Methods:**
+
+```cpp
+std::vector<Triangle> load_obj(const std::string& filepath) const;   // Load OBJ file
+Scene load_scene(const std::string& filepath) const;                  // Parse scene description
+```
+
+### `stb_image_write.h`
+
+Header-only library for writing images.
+
+### `math_utils.h`
+
+Utility math functions.
+
+**Methods:**
+
+**TODO**
+```cpp
+Vector3f sample_hemisphere();
+Vector3f sample_cosine_hemisphere();
+Vector3f sample_sphere();
+Vector3f world_to_local(const Vector3f& v, const Vector3f& normal);
+Vector3f local_to_world(const Vector3f& v, const Vector3f& normal);
+```
