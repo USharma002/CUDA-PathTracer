@@ -35,7 +35,7 @@ Vector3f normalize() const;                        // Returns normalized vector
 ```
 
 <b>TODO</b>
-```
+```cpp
 Vector3f clamp(float min, float max) const;       // Clamps each component
 Vector3f reflect(const Vector3f& normal) const;   // Reflection vector
 Vector3f refract(const Vector3f& normal, float ior) const;  // Refraction vector
