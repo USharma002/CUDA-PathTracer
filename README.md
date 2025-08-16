@@ -5,6 +5,7 @@ It renders photorealistic images using **Monte Carlo integration**, **Russian ro
 
 This implementation is capable of rendering complex scenes interactively or offline, leveraging CUDA’s massive parallelism for efficient global illumination computation.
 
+API description: [Rendering Engine Docs](./media/API.md)
 ## Example Render (Cornell Box)
 
 ![Cornell Box Render](assets/cbox.png)
