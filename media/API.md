@@ -59,6 +59,7 @@ Ray(const Vector3f& origin, const Vector3f& dir, float tmin = 0.0f, float tmax =
 
 * `Vector3f o` — Ray origin
 * `Vector3f d` — Normalized direction
+**TODO**
 * `float tmin` — Minimum valid distance
 * `float tmax` — Maximum valid distance
 
@@ -76,12 +77,13 @@ Stores information about a ray-surface intersection.
 
 **Attributes:**
 
+* `bool hit` — Valid hit or not
 * `Vector3f p` — Hit point
 * `Vector3f n` — Shading normal
 * `float t` — Distance along the ray
-* `Material* material` — Material at intersection
 
 **TODO**
+* `Material* material` — Material at intersection
 * `Vector2f uv` — Texture coordinates
 * `Vector3f wo` — Outgoing direction (-ray.dir)
 
