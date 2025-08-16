@@ -4,17 +4,17 @@
 #include "vec3.h"
 #include "ray.h"
 
-class surface_interaction_record
+class SurfaceInteractionRecord
 {
 public:
-    __host__ __device__ surface_interaction_record() : hit(false), Le(vec3(0, 0, 0)) {}
+    __host__ __device__ SurfaceInteractionRecord() : hit(false), Le(Vector3f(0, 0, 0)) {}
 
     bool hit; // did we hit a surface?
     
-    vec3 n; // Shading Normal 
-    vec3 p; // position of intersection
-    vec3 bsdf; // bsdf of intersected surface
-    vec3 Le; // Emitted Light
+    Vector3f n; // Shading Normal 
+    Vector3f p; // position of intersection
+    Vector3f bsdf; // bsdf of intersected surface
+    Vector3f Le; // Emitted Light
 
     float t; // distance
 };

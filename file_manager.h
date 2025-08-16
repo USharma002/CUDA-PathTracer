@@ -20,8 +20,8 @@
 
 // A simple struct to hold material properties read from the MTL file
 struct Material {
-    vec3 bsdf = vec3(0.8f, 0.8f, 0.8f); // Default to white
-    vec3 Le   = vec3(0.0f, 0.0f, 0.0f);   // Default to no emission
+    Vector3f bsdf = Vector3f(0.8f, 0.8f, 0.8f); // Default to white
+    Vector3f Le   = Vector3f(0.0f, 0.0f, 0.0f);   // Default to no emission
 };
 
 static void check_cuda(cudaError_t result, char const *const func, const char *const file, int const line) {
@@ -62,11 +62,11 @@ static std::map<std::string, Material> loadMTL(const std::string& filename) {
         } else if (prefix == "Kd") { // Diffuse color
             float r, g, b;
             iss >> r >> g >> b;
-            current_material.bsdf = vec3(r, g, b);
+            current_material.bsdf = Vector3f(r, g, b);
         } else if (prefix == "Ke") { // Emissive color
             float r, g, b;
             iss >> r >> g >> b;
-            current_material.Le = vec3(r, g, b);
+            current_material.Le = Vector3f(r, g, b);
         }
     }
 
@@ -78,7 +78,7 @@ static std::map<std::string, Material> loadMTL(const std::string& filename) {
     return materials;
 }
 
-static bool loadOBJ(const std::string& obj_filename, triangle** h_list_out, int& num_triangles_out) {
+static bool loadOBJ(const std::string& obj_filename, Triangle** h_list_out, int& num_triangles_out) {
     std::ifstream file(obj_filename);
     if (!file.is_open()) {
         std::cerr << "Error: Cannot open OBJ file: " << obj_filename << "\n";
@@ -91,9 +91,9 @@ static bool loadOBJ(const std::string& obj_filename, triangle** h_list_out, int&
         path_base = obj_filename.substr(0, last_slash + 1);
     }
     
-    std::vector<vec3> vertices;
-    std::vector<vec3> normals;
-    std::vector<triangle> temp_triangles;
+    std::vector<Vector3f> vertices;
+    std::vector<Vector3f> normals;
+    std::vector<Triangle> temp_triangles;
 
     std::map<std::string, Material> materials;
     Material current_material;
@@ -121,7 +121,7 @@ static bool loadOBJ(const std::string& obj_filename, triangle** h_list_out, int&
                  std::cerr << "Warning on line " << line_num << ": Malformed normal data." << std::endl;
                 continue;
             }
-            normals.emplace_back(unit_vector(vec3(nx, ny, nz)));
+            normals.emplace_back(unit_vector(Vector3f(nx, ny, nz)));
         } else if (prefix == "mtllib") {
             std::string mtl_filename;
             iss >> mtl_filename;
@@ -179,19 +179,19 @@ static bool loadOBJ(const std::string& obj_filename, triangle** h_list_out, int&
             }
 
             // Retrieve vertices
-            vec3 vA = vertices[v_idx[0] - 1];
-            vec3 vB = vertices[v_idx[1] - 1];
-            vec3 vC = vertices[v_idx[2] - 1];
+            Vector3f vA = vertices[v_idx[0] - 1];
+            Vector3f vB = vertices[v_idx[1] - 1];
+            Vector3f vC = vertices[v_idx[2] - 1];
 
             // Determine normal
-            vec3 tri_normal;
+            Vector3f tri_normal;
             if (n_idx[0] != 0 && n_idx[0] <= normals.size()) {
                 tri_normal = normals[n_idx[0] - 1];
             } else {
                 tri_normal = unit_vector(cross(vB - vA, vC - vA));
             }
 
-            triangle tri(vA, vB, vC, current_material.bsdf, tri_normal);
+            Triangle tri(vA, vB, vC, current_material.bsdf, tri_normal);
             tri.Le = current_material.Le;
             temp_triangles.push_back(tri);
         }
@@ -205,8 +205,8 @@ static bool loadOBJ(const std::string& obj_filename, triangle** h_list_out, int&
     }
 
     num_triangles_out = static_cast<int>(temp_triangles.size());
-    checkCudaErrors(cudaMallocHost(h_list_out, num_triangles_out * sizeof(triangle)));
-    memcpy(*h_list_out, temp_triangles.data(), num_triangles_out * sizeof(triangle));
+    checkCudaErrors(cudaMallocHost(h_list_out, num_triangles_out * sizeof(Triangle)));
+    memcpy(*h_list_out, temp_triangles.data(), num_triangles_out * sizeof(Triangle));
 
     std::cout << "Successfully loaded " << num_triangles_out << " triangles from " << obj_filename << std::endl;
     return true;

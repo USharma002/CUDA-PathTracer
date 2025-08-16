@@ -8,11 +8,11 @@
 #    define M_PI 3.14159265358979323846
 #endif
 
-class camera {
+class Sensor {
     public:
-        __host__ __device__ camera(vec3 lookfrom, vec3 lookat, vec3 vup, float vfov, float aspect) {
+        __host__ __device__ Sensor(Vector3f lookfrom, Vector3f lookat, Vector3f vup, float vfov, float aspect) {
             // vfov is top to bottom in degrees
-            vec3 u, v, w;
+            Vector3f u, v, w;
             float theta = vfov*M_PI/180;
             float half_height = tan(theta/2);
             float half_width = aspect * half_height;
@@ -24,12 +24,12 @@ class camera {
             horizontal = 2*half_width*u;
             vertical = 2*half_height*v;
         }
-        __device__ ray get_ray(float u, float v) { return ray(origin, lower_left_corner + u*horizontal + v*vertical - origin); }
+        __device__ Ray get_ray(float u, float v) { return Ray(origin, lower_left_corner + u*horizontal + v*vertical - origin); }
 
-        vec3 origin;
-        vec3 lower_left_corner;
-        vec3 horizontal;
-        vec3 vertical;
+        Vector3f origin;
+        Vector3f lower_left_corner;
+        Vector3f horizontal;
+        Vector3f vertical;
         float image_width;
         float image_height;
 };
