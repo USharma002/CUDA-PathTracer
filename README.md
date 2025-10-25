@@ -17,6 +17,4 @@ API description: [Rendering Engine Docs](./media/API.md)
 - Configurable samples-per-pixel (SPP) and max bounce depth
 
 ## Building & Running
-```bash
-nvcc main.cu -o rt
-./rt
+Run ```build.bat``` to build the project.
