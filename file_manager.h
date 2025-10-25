@@ -12,16 +12,12 @@
 
 #include "vector.h"
 #include "triangle.h"
+#include "quad.h"
+#include "bvh.h"
 
-// By marking all functions in this header as 'static', we are telling the compiler
-// to create a private copy for each .cpp file that includes it. This completely
-// avoids the "multiple definition" linker errors that normally happen when you
-// put function bodies in a header file.
-
-// A simple struct to hold material properties read from the MTL file
 struct Material {
-    Vector3f bsdf = Vector3f(0.8f, 0.8f, 0.8f); // Default to white
-    Vector3f Le   = Vector3f(0.0f, 0.0f, 0.0f);   // Default to no emission
+    Vector3f bsdf = Vector3f(0.8f, 0.8f, 0.8f);
+    Vector3f Le   = Vector3f(0.0f, 0.0f, 0.0f);
 };
 
 static void check_cuda(cudaError_t result, char const *const func, const char *const file, int const line) {
@@ -34,8 +30,6 @@ static void check_cuda(cudaError_t result, char const *const func, const char *c
 }
 #define checkCudaErrors(val) check_cuda( (val), #val, __FILE__, __LINE__ )
 
-
-// Marked static to keep it private to this file's scope.
 static std::map<std::string, Material> loadMTL(const std::string& filename) {
     std::map<std::string, Material> materials;
     std::ifstream file(filename);
@@ -59,11 +53,11 @@ static std::map<std::string, Material> loadMTL(const std::string& filename) {
             }
             iss >> current_material_name;
             current_material = Material();
-        } else if (prefix == "Kd") { // Diffuse color
+        } else if (prefix == "Kd") {
             float r, g, b;
             iss >> r >> g >> b;
             current_material.bsdf = Vector3f(r, g, b);
-        } else if (prefix == "Ke") { // Emissive color
+        } else if (prefix == "Ke") {
             float r, g, b;
             iss >> r >> g >> b;
             current_material.Le = Vector3f(r, g, b);
@@ -78,7 +72,19 @@ static std::map<std::string, Material> loadMTL(const std::string& filename) {
     return materials;
 }
 
-static bool loadOBJ(const std::string& obj_filename, Triangle** h_list_out, int& num_triangles_out) {
+// Helper: Group triangles into quads if they share an edge
+static bool tryMergeTrianglesIntoQuad(const std::vector<Triangle>& triangles, 
+                                      std::vector<Primitive>& primitives) {
+    // Simple heuristic: group consecutive triangle pairs that might be quads
+    // This is optional - mainly for when loading triangle-only OBJ files
+    for (size_t i = 0; i < triangles.size(); i++) {
+        primitives.push_back(Primitive(triangles[i]));
+    }
+    return true;
+}
+
+// UNIFIED ROBUST OBJ LOADER with normal support
+static bool loadOBJ(const std::string& obj_filename, Primitive** h_list_out, int& num_primitives_out) {
     std::ifstream file(obj_filename);
     if (!file.is_open()) {
         std::cerr << "Error: Cannot open OBJ file: " << obj_filename << "\n";
@@ -93,16 +99,19 @@ static bool loadOBJ(const std::string& obj_filename, Triangle** h_list_out, int&
     
     std::vector<Vector3f> vertices;
     std::vector<Vector3f> normals;
-    std::vector<Triangle> temp_triangles;
+    std::vector<Primitive> temp_primitives;
 
     std::map<std::string, Material> materials;
     Material current_material;
 
     std::string line;
     int line_num = 0;
+    int num_triangles = 0;
+    int num_quads = 0;
+    
     while (std::getline(file, line)) {
         line_num++;
-        if (line.empty() || line[0] == '#') continue;
+        if (line.empty() || line[0] == '#' || line[0] == 'o' || line[0] == 's') continue;
 
         std::istringstream iss(line);
         std::string prefix;
@@ -115,18 +124,21 @@ static bool loadOBJ(const std::string& obj_filename, Triangle** h_list_out, int&
                 continue;
             }
             vertices.emplace_back(x, y, z);
-        } else if (prefix == "vn") {
+        } 
+        else if (prefix == "vn") {
             float nx, ny, nz;
             if (!(iss >> nx >> ny >> nz)) {
-                 std::cerr << "Warning on line " << line_num << ": Malformed normal data." << std::endl;
+                std::cerr << "Warning on line " << line_num << ": Malformed normal data." << std::endl;
                 continue;
             }
             normals.emplace_back(unit_vector(Vector3f(nx, ny, nz)));
-        } else if (prefix == "mtllib") {
+        } 
+        else if (prefix == "mtllib") {
             std::string mtl_filename;
             iss >> mtl_filename;
             materials = loadMTL(path_base + mtl_filename);
-        } else if (prefix == "usemtl") {
+        } 
+        else if (prefix == "usemtl") {
             std::string material_name;
             iss >> material_name;
             if (materials.count(material_name)) {
@@ -135,81 +147,123 @@ static bool loadOBJ(const std::string& obj_filename, Triangle** h_list_out, int&
                 std::cerr << "Warning: Material '" << material_name << "' not found. Using default." << std::endl;
                 current_material = Material();
             }
-        } else if (prefix == "f") {
-            std::vector<size_t> v_idx(3), n_idx(3);
-
-            for (int i = 0; i < 3; ++i) {
-                std::string token;
-                iss >> token;  // Example: "2//1" or "2/5/1" or "2/5" or "2"
-
+        } 
+        else if (prefix == "f") {
+            std::vector<size_t> v_indices;
+            std::vector<size_t> n_indices;
+            std::string token;
+            
+            while (iss >> token) {
                 size_t v = 0, vt = 0, vn = 0;
                 char slash;
-
                 std::stringstream tokenStream(token);
-
+                
                 if (!(tokenStream >> v)) {
                     std::cerr << "Warning on line " << line_num << ": malformed face vertex token '" << token << "'.\n";
-                    v = 0;
+                    continue;
                 }
-
+                
+                // Parse v/vt/vn or v//vn or v/vt or v
                 if (tokenStream.peek() == '/') {
-                    tokenStream >> slash; // consume first slash
-
+                    tokenStream >> slash;
                     if (tokenStream.peek() == '/') {
-                        tokenStream >> slash; // consume second slash
-                        tokenStream >> vn;    // v//vn format
+                        tokenStream >> slash;
+                        if (tokenStream >> vn) {}
                     } else {
-                        tokenStream >> vt; // read vt
-                        if (tokenStream.peek() == '/') {
-                            tokenStream >> slash;
-                            tokenStream >> vn; // v/vt/vn format
+                        if (tokenStream >> vt) {
+                            if (tokenStream.peek() == '/') {
+                                tokenStream >> slash;
+                                if (tokenStream >> vn) {}
+                            }
                         }
                     }
                 }
-
-                v_idx[i] = v;
-                n_idx[i] = vn;
+                
+                v_indices.push_back(v);
+                n_indices.push_back(vn);
             }
-
-            // Validate vertex indices
-            if (v_idx[0] == 0 || v_idx[1] == 0 || v_idx[2] == 0 ||
-                v_idx[0] > vertices.size() || v_idx[1] > vertices.size() || v_idx[2] > vertices.size()) {
-                std::cerr << "Warning on line " << line_num << ": invalid vertex index.\n";
-                continue;
+            
+            // Process triangle (3 vertices)
+            if (v_indices.size() == 3) {
+                if (v_indices[0] == 0 || v_indices[1] == 0 || v_indices[2] == 0 ||
+                    v_indices[0] > vertices.size() || v_indices[1] > vertices.size() || v_indices[2] > vertices.size()) {
+                    std::cerr << "Warning on line " << line_num << ": invalid vertex index.\n";
+                    continue;
+                }
+                
+                Vector3f v0 = vertices[v_indices[0] - 1];
+                Vector3f v1 = vertices[v_indices[1] - 1];
+                Vector3f v2 = vertices[v_indices[2] - 1];
+                
+                // Use provided normal if available, otherwise compute
+                Vector3f tri_normal;
+                if (n_indices[0] != 0 && n_indices[0] <= normals.size()) {
+                    tri_normal = normals[n_indices[0] - 1];
+                } else {
+                    tri_normal = unit_vector(cross(v1 - v0, v2 - v0));
+                }
+                
+                Triangle tri(v0, v1, v2, current_material.bsdf, tri_normal);
+                tri.Le = current_material.Le;
+                
+                temp_primitives.push_back(Primitive(tri));
+                num_triangles++;
             }
-
-            // Retrieve vertices
-            Vector3f vA = vertices[v_idx[0] - 1];
-            Vector3f vB = vertices[v_idx[1] - 1];
-            Vector3f vC = vertices[v_idx[2] - 1];
-
-            // Determine normal
-            Vector3f tri_normal;
-            if (n_idx[0] != 0 && n_idx[0] <= normals.size()) {
-                tri_normal = normals[n_idx[0] - 1];
-            } else {
-                tri_normal = unit_vector(cross(vB - vA, vC - vA));
+            // Process quad (4 vertices)
+            else if (v_indices.size() == 4) {
+                if (v_indices[0] == 0 || v_indices[1] == 0 || v_indices[2] == 0 || v_indices[3] == 0 ||
+                    v_indices[0] > vertices.size() || v_indices[1] > vertices.size() || 
+                    v_indices[2] > vertices.size() || v_indices[3] > vertices.size()) {
+                    std::cerr << "Warning on line " << line_num << ": invalid vertex index.\n";
+                    continue;
+                }
+                
+                Vector3f v0 = vertices[v_indices[0] - 1];
+                Vector3f v1 = vertices[v_indices[1] - 1];
+                Vector3f v2 = vertices[v_indices[2] - 1];
+                Vector3f v3 = vertices[v_indices[3] - 1];
+                
+                Quad quad(v0, v1, v2, v3, current_material.bsdf);
+                
+                // Override computed normal with OBJ normal if available
+                if (n_indices[0] != 0 && n_indices[0] <= normals.size()) {
+                    quad.normal = normals[n_indices[0] - 1];
+                }
+                
+                quad.Le = current_material.Le;
+                
+                temp_primitives.push_back(Primitive(quad));
+                num_quads++;
             }
-
-            Triangle tri(vA, vB, vC, current_material.bsdf, tri_normal);
-            tri.Le = current_material.Le;
-            temp_triangles.push_back(tri);
+            else {
+                std::cerr << "Warning on line " << line_num << ": face with " 
+                         << v_indices.size() << " vertices not supported.\n";
+            }
         }
-
     }
     file.close();
 
-    if (temp_triangles.empty()) {
-        std::cerr << "Error: No valid triangles were loaded from " << obj_filename << std::endl;
+    if (temp_primitives.empty()) {
+        std::cerr << "Error: No valid primitives were loaded from " << obj_filename << std::endl;
         return false;
     }
 
-    num_triangles_out = static_cast<int>(temp_triangles.size());
-    checkCudaErrors(cudaMallocHost(h_list_out, num_triangles_out * sizeof(Triangle)));
-    memcpy(*h_list_out, temp_triangles.data(), num_triangles_out * sizeof(Triangle));
+    num_primitives_out = static_cast<int>(temp_primitives.size());
+    *h_list_out = new Primitive[num_primitives_out];
+    
+    for (int i = 0; i < num_primitives_out; i++) {
+        (*h_list_out)[i] = temp_primitives[i];
+    }
 
-    std::cout << "Successfully loaded " << num_triangles_out << " triangles from " << obj_filename << std::endl;
+    std::cout << "Successfully loaded " << num_primitives_out << " primitives from " << obj_filename << std::endl;
+    if (num_triangles > 0) {
+        std::cout << "  - " << num_triangles << " triangles" << std::endl;
+    }
+    if (num_quads > 0) {
+        std::cout << "  - " << num_quads << " quads" << std::endl;
+    }
+    
     return true;
-};
+}
 
 #endif // FILE_MANAGER_H

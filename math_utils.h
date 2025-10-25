@@ -1,3 +1,4 @@
+#pragma once
 #define RANDVector3f Vector3f(curand_uniform(local_rand_state),curand_uniform(local_rand_state),curand_uniform(local_rand_state))
 
 #ifndef FLT_MAX
@@ -14,6 +15,9 @@
 #define M_INV_PI    (1.0f / M_PI)
 #define M_INV_2PI   (1.0f / (2.0f * M_PI))
 #define M_INV_4PI   (1.0f / (4.0f * M_PI))
+
+#define ToRadian(x) (float)(((x) * M_PI / 180.0f))
+#define ToDegree(x) (float)(((x) * 180.0f / M_PI))
 
 __device__ Vector3f random_in_unit_sphere(curandState *local_rand_state) {
     Vector3f p;

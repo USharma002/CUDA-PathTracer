@@ -10,16 +10,16 @@ class Ray
             o = origin; // origin 
             d = unit_vector(direction); // direction
         }
-        __device__ Vector3f origin() const { 
+        __host__ __device__ Vector3f origin() const { 
             return o; // origin of the ray
         }
-        __device__ Vector3f direction() const { 
+        __host__ __device__ Vector3f direction() const { 
             return d; // direction of the ray
         }
-        __device__ Vector3f at(float t) const {
+        __host__ __device__ Vector3f at(float t) const {
             return o + t*d; // point at distance t along the ray
         }
-        __device__ Vector3f normalize() const { 
+        __host__ __device__ Vector3f normalize() const { 
             return unit_vector(d); 
         }
 
