@@ -20,6 +20,23 @@
 #include <optix_device.h>
 
 // ============================================================================
+// CONSTANTS
+// ============================================================================
+
+// Numerical stability threshold for coordinate system building
+constexpr float NORMAL_EPSILON = 0.999f;
+
+// Gamma correction value for sRGB output
+constexpr float GAMMA_CORRECTION = 2.2f;
+
+// Ray tracing constants
+constexpr float RAY_TMIN = 0.001f;
+constexpr float RAY_TMAX = 1e16f;
+
+// Pi constant
+constexpr float PI = 3.14159265359f;
+
+// ============================================================================
 // LAUNCH PARAMETERS
 // ============================================================================
 
@@ -169,10 +186,10 @@ extern "C" __global__ void __raygen__rg() {
     pixel_color = pixel_color / (pixel_color + Vector3f(1.0f, 1.0f, 1.0f));
     
     // Gamma correction
-    const float gamma = 1.0f / 2.2f;
-    pixel_color.e[0] = powf(pixel_color.e[0], gamma);
-    pixel_color.e[1] = powf(pixel_color.e[1], gamma);
-    pixel_color.e[2] = powf(pixel_color.e[2], gamma);
+    const float inv_gamma = 1.0f / GAMMA_CORRECTION;
+    pixel_color.e[0] = powf(pixel_color.e[0], inv_gamma);
+    pixel_color.e[1] = powf(pixel_color.e[1], inv_gamma);
+    pixel_color.e[2] = powf(pixel_color.e[2], inv_gamma);
     
     // Write to output
     const int pixel_idx = (y * params.width + x) * 3;
@@ -254,14 +271,14 @@ extern "C" __global__ void __closesthit__ch() {
         float r2 = randomFloat(payload->seed);
         
         float r = sqrtf(r1);
-        float theta = 2.0f * 3.14159265359f * r2;
+        float theta = 2.0f * PI * r2;
         float x = r * cosf(theta);
         float y = r * sinf(theta);
         float z = sqrtf(1.0f - r1);
         
         // Build local coordinate system
         Vector3f tangent, bitangent;
-        if (fabsf(normal.z()) < 0.999f) {
+        if (fabsf(normal.z()) < NORMAL_EPSILON) {
             tangent = unit_vector(cross(Vector3f(0, 0, 1), normal));
         } else {
             tangent = unit_vector(cross(Vector3f(1, 0, 0), normal));

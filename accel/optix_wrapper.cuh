@@ -189,7 +189,19 @@ void printDeviceCapabilities();
 #include <optix_stubs.h>
 #include <optix_function_table_definition.h>
 
-// Implementation would go here when OptiX SDK is available
+// TODO: Full OptiX implementation
+// When OptiX SDK is available, implement the following:
+// 1. OptixWrapper::initialize() - Create OptiX context and initialize device
+// 2. OptixWrapper::createContext() - Set up OptixDeviceContext with logging callback
+// 3. OptixWrapper::createModule() - Compile PTX from optix_programs.cu
+// 4. OptixWrapper::createProgramGroups() - Create raygen, miss, and hitgroup programs
+// 5. OptixWrapper::createPipeline() - Link program groups into pipeline
+// 6. OptixWrapper::buildAccelerationStructure() - Build GAS from triangles
+// 7. OptixWrapper::createSBT() - Set up shader binding table
+// 8. OptixWrapper::launch() - Launch ray tracing with optixLaunch()
+//
+// Reference: NVIDIA OptiX Programming Guide
+// https://raytracing-docs.nvidia.com/optix7/guide/index.html
 
 #else
 

@@ -18,12 +18,14 @@ constexpr int DEFAULT_HEIGHT = 800;
 constexpr float MOUSE_SENSITIVITY = 0.25f;
 constexpr float ZOOM_SENSITIVITY = 0.1f;
 
-// Grid visualization
-constexpr int GRID_RES = 20;
-constexpr int GRID_SIZE = GRID_RES * GRID_RES;
+// Grid visualization - use values from integrator.h to avoid duplication
+// GRID_RES and GRID_SIZE are defined in integrator.h
+// These aliases provide access in the config namespace
+constexpr int CONFIG_GRID_RES = GRID_RES;       // Use GRID_RES from integrator.h
+constexpr int CONFIG_GRID_SIZE = GRID_SIZE;     // Use GRID_SIZE from integrator.h
 
-// Radiosity
-constexpr int RADIOSITY_HISTORY = 10;
+// Radiosity history size (also defined in primitive.h/triangle.h/quad.h)
+constexpr int CONFIG_RADIOSITY_HISTORY = RADIOSITY_HISTORY;
 
 // Default paths
 constexpr const char* DEFAULT_SCENE_FILE = "./scenes/cbox_quads.obj";
