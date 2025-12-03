@@ -4,13 +4,10 @@
 #include "vector.h"
 #include "ray.h"
 #include "surface_interaction_record.h"
+#include "render_config.h"
 
 #ifndef RADIOSITY_HISTORY
-#define RADIOSITY_HISTORY 10  // 100x100 default
-#endif
-
-#ifndef GRID_SIZE
-#define GRID_SIZE 400  // 100x100 default
+#define RADIOSITY_HISTORY 10
 #endif
 
 class Quad {
@@ -142,8 +139,8 @@ public:
     Vector3f unshot_rad;
     float area;
     
-    float grid[10000];
-    Vector3f radiosity_grid[10000];
+    float grid[GRID_SIZE];
+    Vector3f radiosity_grid[GRID_SIZE];
 
     Vector3f radiosity_history[RADIOSITY_HISTORY];
     int history_index;

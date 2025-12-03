@@ -3,6 +3,8 @@
 
 #include "triangle.h"
 #include "quad.h"
+#include <algorithm>
+#include <vector>
 
 #ifndef RADIOSITY_HISTORY
 #define RADIOSITY_HISTORY 10
@@ -61,7 +63,7 @@ public:
         return *this;
     }
     
-    // Destructor - CRITICAL FIX
+    // Destructor
     __host__ __device__ ~Primitive() {
         // Don't need to explicitly call destructors for POD-like types
         // The union members will be cleaned up automatically
@@ -226,6 +228,46 @@ public:
     
     __host__ __device__ Vector3f* getRadiosityGrid() {
         return (type == PRIM_TRIANGLE) ? tri.radiosity_grid : quad.radiosity_grid;
+    }
+    
+    // ================ NEW: Top-K histogram support ================
+    
+    // Get maximum value in grid
+    __host__ float getGridMaxValue() const {
+        const float* grid = (type == PRIM_TRIANGLE) ? tri.grid : quad.grid;
+        float max_val = 0.0f;
+        for (int i = 0; i < GRID_SIZE; i++) {
+            max_val = fmaxf(max_val, grid[i]);
+        }
+        return max_val;
+    }
+    
+    // Find top-K cells by value
+    __host__ void getTopKIndices(int k, int* out_indices, float* out_values, int& actual_count) const {
+        const float* grid = (type == PRIM_TRIANGLE) ? tri.grid : quad.grid;
+        
+        if (k <= 0) {
+            actual_count = 0;
+            return;
+        }
+        
+        // Create temporary pairs of (index, value)
+        std::vector<std::pair<int, float>> pairs;
+        for (int i = 0; i < GRID_SIZE; i++) {
+            pairs.push_back({i, grid[i]});
+        }
+        
+        // Sort in descending order and keep top-K
+        std::partial_sort(pairs.begin(), 
+                         pairs.begin() + std::min(k, (int)pairs.size()),
+                         pairs.end(),
+                         [](const auto& a, const auto& b) { return a.second > b.second; });
+        
+        actual_count = std::min(k, (int)pairs.size());
+        for (int i = 0; i < actual_count; i++) {
+            out_indices[i] = pairs[i].first;
+            out_values[i] = pairs[i].second;
+        }
     }
 };
 

@@ -1,108 +1,39 @@
 #include "math_utils.h"
+#include "sampling_utils.h"
+#include "render_config.h"
 
-// Match the grid size from triangle.h and quad.h
-#define GRID_RES 20  // Changed from 20 to 100
+// Use grid size from render_config.h (DEFAULT_GRID_RES = 50)
+#ifndef GRID_RES
+#define GRID_RES DEFAULT_GRID_RES
+#endif
 #define RES GRID_RES
-#define GRID_SIZE (GRID_RES * GRID_RES)  // 10000
-
-// ==================== SAMPLING MODE ENUM ====================
-
-enum SamplingMode {
-    SAMPLING_BSDF = 0,
-    SAMPLING_GRID = 1,
-    SAMPLING_MIS = 2
-};
+#ifndef GRID_SIZE
+#define GRID_SIZE (GRID_RES * GRID_RES)
+#endif
 
 // ==================== OPTIMIZED GRID SAMPLING WITH CACHING ====================
 
 struct SurfaceSamplingData {
-    float cdf_x[GRID_RES];      // Single row CDF for faster lookup
-    float cdf_y[GRID_RES];      // Marginal CDF
+    float cdf_x[GRID_RES];
+    float cdf_y[GRID_RES];
     float total_weight;
     bool is_valid;
 };
 
-// Helper to access 1D grid as 2D
-__device__ inline float getGridValue(const float* grid, int i, int j) {
-    return grid[i * GRID_RES + j];
-}
-
-// OPTIMIZED: Faster PDF building with early exit and reduced memory
+// Keep old interface for compatibility, use fast utilities
 __device__ void buildGridPDF(const float* grid, SurfaceSamplingData &sampling_data) {
-    float row_sums[GRID_RES];
-    float total = 0.0f;
-    
-    // Single pass to compute row sums and total
-    #pragma unroll 4
-    for (int v = 0; v < GRID_RES; v++) {
-        float row_sum = 0.0f;
-        #pragma unroll 4
-        for (int u = 0; u < GRID_RES; u++) {
-            row_sum += getGridValue(grid, v, u);
-        }
-        row_sums[v] = row_sum;
-        total += row_sum;
-    }
-    
-    // Early exit for empty grids
-    if (total < 1e-6f) {
-        sampling_data.is_valid = false;
-        return;
-    }
-    
+    float total;
+    buildGridPDFFast(grid, GRID_RES, sampling_data.cdf_y, total);
     sampling_data.total_weight = total;
-    sampling_data.is_valid = true;
-    
-    // Build marginal CDF
-    float running_sum = 0.0f;
-    for (int v = 0; v < GRID_RES; v++) {
-        sampling_data.cdf_y[v] = running_sum / total;
-        running_sum += row_sums[v];
-    }
+    sampling_data.is_valid = (total > 1e-6f);
 }
 
-// OPTIMIZED: Build conditional CDF on-demand for selected row only
 __device__ void buildConditionalCDF(const float* grid, int v_idx, float* cdf_x) {
-    float row_sum = 0.0f;
-    
-    // Compute row sum
-    for (int u = 0; u < GRID_RES; u++) {
-        row_sum += getGridValue(grid, v_idx, u);
-    }
-    
-    if (row_sum < 1e-6f) {
-        // Uniform distribution for empty row
-        for (int u = 0; u < GRID_RES; u++) {
-            cdf_x[u] = float(u) / float(GRID_RES);
-        }
-        return;
-    }
-    
-    // Build CDF
-    float running_sum = 0.0f;
-    for (int u = 0; u < GRID_RES; u++) {
-        cdf_x[u] = running_sum / row_sum;
-        running_sum += getGridValue(grid, v_idx, u);
-    }
+    buildConditionalCDFFast(grid, v_idx, GRID_RES, cdf_x);
 }
 
-// OPTIMIZED: Binary search with bounds checking
 __device__ inline int binarySearchCDF(const float* cdf, int size, float xi) {
-    // Clamp xi to valid range
-    xi = fminf(fmaxf(xi, 0.0f), 0.999999f);
-    
-    int left = 0;
-    int right = size - 1;
-    
-    while (left < right) {
-        int mid = (left + right) >> 1;  // Faster than division
-        if (xi < cdf[mid + 1]) {
-            right = mid;
-        } else {
-            left = mid + 1;
-        }
-    }
-    return left;
+    return binarySearchCDFFast(cdf, size, xi);
 }
 
 // OPTIMIZED: Grid sampling with on-demand conditional CDF
@@ -162,71 +93,122 @@ __device__ Vector3f localToWorld(const Vector3f &local, const Vector3f &normal,
     return tangent * local.x() + bitangent * local.y() + normal * local.z();
 }
 
-// ==================== IMPROVED BSDF SAMPLING ====================
-
-__device__ Vector3f sampleCosineWeightedHemisphere(const Vector3f &normal, curandState *rand_state) {
-    // Malley's method for cosine-weighted hemisphere sampling
-    float u1 = curand_uniform(rand_state);
-    float u2 = curand_uniform(rand_state);
-    
-    float r = sqrtf(u1);
-    float theta = 2.0f * M_PI * u2;
-    
-    float x = r * cosf(theta);
-    float y = r * sinf(theta);
-    float z = sqrtf(fmaxf(0.0f, 1.0f - u1));
-    
-    Vector3f tangent, bitangent;
-    buildCoordinateSystem(normal, tangent, bitangent);
-    
-    return unit_vector(tangent * x + bitangent * y + normal * z);
-}
 
 // ==================== GRID-BASED DIRECTION SAMPLING ====================
 
-__device__ Vector3f sampleGridDirection(const float* grid, const Vector3f &normal, 
-                                        curandState *rand_state, bool &success) {
-    SurfaceSamplingData sampling_data;
-    buildGridPDF(grid, sampling_data);
+// ==================== OPTIMIZED GRID SAMPLING ====================
+
+// Sample from form factor grid using SPHERICAL coordinates with PDF output
+// Only samples from upper hemisphere (theta in [0, π/2])
+__device__ inline Vector3f sampleGridDirectionWithPDF(const float* grid, const Vector3f &normal, 
+                                        curandState *rand_state, bool &success, float &pdf_out) {
+    // Build CDF only for upper hemisphere
+    int half_res = GRID_RES / 2;
+    float row_sums[GRID_RES];
+    float cdf_y[GRID_RES];
+    float hemisphere_weight = 0.0f;
     
-    if (!sampling_data.is_valid) {
-        success = false;
-        return Vector3f(0, 0, 0);
+    for (int v = 0; v < half_res; v++) {
+        float row_sum = 0.0f;
+        for (int u = 0; u < GRID_RES; u++) {
+            row_sum += grid[v * GRID_RES + u];
+        }
+        row_sums[v] = row_sum;
+        hemisphere_weight += row_sum;
+        cdf_y[v] = hemisphere_weight;
     }
     
-    Vector2f uv = sampleGridPDF(grid, sampling_data, rand_state);
-    Vector3f local_dir = uvToDirection(uv.x(), uv.y());
+    if (hemisphere_weight < 1e-6f) {
+        success = false;
+        Vector3f dir = sampleCosineWeightedHemisphereFast(normal, rand_state);
+        pdf_out = cosinePDF(dir, normal);
+        return dir;
+    }
     
-    Vector3f tangent, bitangent;
-    buildCoordinateSystem(normal, tangent, bitangent);
+    // Normalize CDF
+    for (int v = 0; v < half_res; v++) {
+        cdf_y[v] /= hemisphere_weight;
+    }
     
-    Vector3f world_dir = localToWorld(local_dir, normal, tangent, bitangent);
-    success = true;
-    return unit_vector(world_dir);
-}
-
-// ==================== IMPROVED MIS ====================
-
-__device__ Vector3f sampleMIS(const float* grid, const Vector3f &normal, 
-                              curandState *rand_state, float &weight) {
-    float sample_choice = curand_uniform(rand_state);
+    // Sample row (theta index) from upper hemisphere only
+    float xi1 = curand_uniform(rand_state);
+    int theta_idx = binarySearchCDF(cdf_y, half_res, xi1);
     
-    // Try grid sampling first if available
-    if (sample_choice < 0.5f) {
-        bool success;
-        Vector3f dir = sampleGridDirection(grid, normal, rand_state, success);
-        if (success) {
-            weight = 2.0f;
-            return dir;
+    // Sample column (phi index)
+    float cdf_x[GRID_RES];
+    float row_sum = row_sums[theta_idx];
+    if (row_sum < 1e-6f) {
+        for (int u = 0; u < GRID_RES; u++) cdf_x[u] = (u + 1.0f) / GRID_RES;
+    } else {
+        float rs = 0.0f;
+        for (int u = 0; u < GRID_RES; u++) {
+            rs += grid[theta_idx * GRID_RES + u];
+            cdf_x[u] = rs / row_sum;
         }
     }
     
-    // BSDF sampling
-    weight = 2.0f;
-    return sampleCosineWeightedHemisphere(normal, rand_state);
+    float xi2 = curand_uniform(rand_state);
+    int phi_idx = binarySearchCDF(cdf_x, GRID_RES, xi2);
+    
+    // Convert grid indices to SPHERICAL coordinates (hemisphere only)
+    float theta = ((theta_idx + curand_uniform(rand_state)) / half_res) * (M_PI * 0.5f);
+    theta = fminf(theta, M_PI * 0.5f - 0.01f);  // Stay away from horizon
+    float phi = ((phi_idx + curand_uniform(rand_state)) / GRID_RES) * 2.0f * M_PI;
+    
+    // Convert spherical to Cartesian in local space
+    float sin_theta = sinf(theta);
+    float cos_theta = cosf(theta);
+    Vector3f local_dir(sin_theta * cosf(phi), sin_theta * sinf(phi), cos_theta);
+    
+    // Transform to world space
+    Vector3f tangent, bitangent;
+    buildCoordinateSystemFast(normal, tangent, bitangent);
+    Vector3f world_dir = unit_vector(localToWorldFast(local_dir, normal, tangent, bitangent));
+    
+    // Compute the grid sampling PDF (hemisphere-adjusted)
+    float cell_value = grid[theta_idx * GRID_RES + phi_idx];
+    float cell_prob = cell_value / fmaxf(hemisphere_weight, 1e-6f);
+    float d_theta = (M_PI * 0.5f) / half_res;
+    float d_phi = 2.0f * M_PI / GRID_RES;
+    float cell_solid_angle = fmaxf(sin_theta, 0.01f) * d_theta * d_phi;
+    pdf_out = cell_prob / fmaxf(cell_solid_angle, 1e-6f);
+    
+    success = true;
+    return world_dir;
 }
 
-// ==================== OPTIMIZED PATH TRACER ====================
+// Legacy version without PDF (for compatibility)
+__device__ inline Vector3f sampleGridDirection(const float* grid, const Vector3f &normal, 
+                                        curandState *rand_state, bool &success) {
+    float pdf_unused;
+    return sampleGridDirectionWithPDF(grid, normal, rand_state, success, pdf_unused);
+}
+
+// ==================== RADIOSITY DIRECTION SAMPLING ====================
+
+// Sample from radiosity grid with PDF output
+__device__ inline Vector3f sampleRadiosityDirectionWithPDF(const Vector3f* radiosity_grid, const Vector3f &normal,
+                                            curandState *rand_state, bool &success, float &pdf_out) {
+    float total_weight = computeRadiosityTotalWeight(radiosity_grid, GRID_RES);
+    
+    if (total_weight < 1e-6f) {
+        success = false;
+        Vector3f dir = sampleCosineWeightedHemisphereFast(normal, rand_state);
+        pdf_out = cosinePDF(dir, normal);
+        return dir;
+    }
+    
+    return sampleRadiosityGridSpherical(radiosity_grid, GRID_RES, normal, rand_state, pdf_out, total_weight);
+}
+
+__device__ inline Vector3f sampleRadiosityDirection(const Vector3f* radiosity_grid, const Vector3f &normal,
+                                            curandState *rand_state, bool &success) {
+    float pdf_unused;
+    Vector3f dir = sampleRadiosityDirectionWithPDF(radiosity_grid, normal, rand_state, success, pdf_unused);
+    return dir;
+}
+
+// ==================== PATH TRACER ====================
 
 __device__ void integrator(const Scene *s, Ray &ray_, Vector3f &L, int max_depth, 
                           curandState *rand_state, SamplingMode sampling_mode) {
@@ -264,32 +246,77 @@ __device__ void integrator(const Scene *s, Ray &ray_, Vector3f &L, int max_depth
         float mis_weight = 1.0f;
         
         // Branch-reduced sampling selection
-        bool use_grid = (sampling_mode == SAMPLING_GRID || sampling_mode == SAMPLING_MIS);
+        bool use_grid = (sampling_mode == SamplingMode::SAMPLING_FORMFACTOR || 
+                         sampling_mode == SamplingMode::SAMPLING_RADIOSITY ||
+                         sampling_mode == SamplingMode::SAMPLING_TOPK ||
+                         sampling_mode == SamplingMode::SAMPLING_MIS);
         bool has_grid = false;
         const float* grid = nullptr;
+        const Vector3f* radiosity_grid = nullptr;
         
         if (use_grid && si.prim_ptr != nullptr) {
-            if (si.hit_type == HIT_TRIANGLE) {
-                grid = si.prim_ptr->tri.grid;
-            } else if (si.hit_type == HIT_QUAD) {
-                grid = si.prim_ptr->quad.grid;
+            // Always get radiosity grid for MIS and RADIOSITY modes
+            if (sampling_mode == SamplingMode::SAMPLING_RADIOSITY || 
+                sampling_mode == SamplingMode::SAMPLING_MIS) {
+                if (si.hit_type == HIT_TRIANGLE) {
+                    radiosity_grid = si.prim_ptr->tri.radiosity_grid;
+                } else if (si.hit_type == HIT_QUAD) {
+                    radiosity_grid = si.prim_ptr->quad.radiosity_grid;
+                }
+                has_grid = (radiosity_grid != nullptr);
+            } else {
+                // Use form factor grid for FORMFACTOR and TOPK modes
+                if (si.hit_type == HIT_TRIANGLE) {
+                    grid = si.prim_ptr->tri.grid;
+                } else if (si.hit_type == HIT_QUAD) {
+                    grid = si.prim_ptr->quad.grid;
+                }
+                has_grid = (grid != nullptr);
             }
-            has_grid = (grid != nullptr);
         }
         
         // Sample direction based on mode
-        if (sampling_mode == SAMPLING_BSDF || !has_grid) {
-            next_dir = sampleCosineWeightedHemisphere(shading_normal, rand_state);
+        if (sampling_mode == SamplingMode::SAMPLING_BSDF || !has_grid) {
+            next_dir = sampleCosineWeightedHemisphereFast(shading_normal, rand_state);
         }
-        else if (sampling_mode == SAMPLING_GRID) {
+        else if (sampling_mode == SamplingMode::SAMPLING_FORMFACTOR) {
             bool success;
-            next_dir = sampleGridDirection(grid, shading_normal, rand_state, success);
+            float grid_pdf;
+            next_dir = sampleGridDirectionWithPDF(grid, shading_normal, rand_state, success, grid_pdf);
             if (!success) {
-                next_dir = sampleCosineWeightedHemisphere(shading_normal, rand_state);
+                next_dir = sampleCosineWeightedHemisphereFast(shading_normal, rand_state);
+            } else {
+                // PDF correction: weight = (cosine_pdf) / (grid_pdf)
+                // cosine_pdf = cos(theta) / pi
+                float cos_theta = fmaxf(dot(next_dir, shading_normal), 0.0f);
+                float cosine_pdf = cos_theta / M_PI;
+                float weight = cosine_pdf / fmaxf(grid_pdf, 1e-6f);
+                weight = fminf(weight, 10.0f);  // Clamp to prevent fireflies
+                throughput *= weight;
             }
         }
-        else { // SAMPLING_MIS
-            next_dir = sampleMIS(grid, shading_normal, rand_state, mis_weight);
+        else if (sampling_mode == SamplingMode::SAMPLING_RADIOSITY) {
+            bool success;
+            float grid_pdf;
+            next_dir = sampleRadiosityDirectionWithPDF(radiosity_grid, shading_normal, rand_state, success, grid_pdf);
+            if (!success) {
+                next_dir = sampleCosineWeightedHemisphereFast(shading_normal, rand_state);
+            } else {
+                // PDF correction: weight = (cosine_pdf) / (grid_pdf)
+                float cos_theta = fmaxf(dot(next_dir, shading_normal), 0.0f);
+                float cosine_pdf = cos_theta / M_PI;
+                float weight = cosine_pdf / fmaxf(grid_pdf, 1e-6f);
+                weight = fminf(weight, 10.0f);  // Clamp to prevent fireflies
+                throughput *= weight;
+            }
+        }
+        else if (sampling_mode == SamplingMode::SAMPLING_MIS) {
+            // Use radiosity-based MIS (correct version)
+            next_dir = sampleMISFastRadiosity(radiosity_grid, GRID_RES, shading_normal, rand_state, mis_weight);
+            throughput *= mis_weight;
+        }
+        else { // SAMPLING_TOPK - use form factor grid
+            next_dir = sampleMISFast(grid, GRID_RES, shading_normal, rand_state, mis_weight);
             throughput *= mis_weight;
         }
         
@@ -322,7 +349,7 @@ __device__ void radiosity_integrator(const Scene *s, Ray &ray_, Vector3f &L, int
         Vector3f shading_normal = dot(r.direction(), outward_normal) < 0 ? outward_normal : -outward_normal;
 
         // Use improved cosine-weighted sampling
-        Vector3f next_dir = sampleCosineWeightedHemisphere(shading_normal, rand_state);
+        Vector3f next_dir = sampleCosineWeightedHemisphereFast(shading_normal, rand_state);
 
         r = Ray(si.p + shading_normal * 1e-4f, next_dir);
     }
@@ -357,7 +384,7 @@ __global__ void render(unsigned char* image, Sensor* cam, Scene *s, curandState 
         Ray r = cam->get_ray(u, v);
         
         Vector3f sample_col = Vector3f(0, 0, 0);
-        integrator(s, r, sample_col, 10, local_rand_state, sampling_mode);
+        integrator(s, r, sample_col, 5, local_rand_state, sampling_mode);
         col += sample_col;
     }
 

@@ -9,13 +9,11 @@
 #include "quad.h"
 #include "bvh.h"
 #include "ray.h"
+#include "render_config.h"
+#include "grid_filter.h"  // Bilateral filtering for radiosity grids (can safely remove this line)
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846f
-#endif
-
-#ifndef GRID_RESOLUTION
-#define GRID_RESOLUTION 20  // Or include main.cu's GRID_RES
 #endif
 
 // ==================== INITIALIZATION ====================
@@ -113,6 +111,10 @@ __device__ bool visibility_test(const Ray& r, float max_dist,
 }
 
 // ==================== FORM FACTOR KERNELS ====================
+
+// Generate random points on Patch i and Patch j, test visibility, accumulate form factor
+// On an average will give area-weighted form factors using Monte Carlo integration
+// Also update the directional grid, have to fix later
 
 __global__ void calculate_form_factors_mc_kernel(float* form_factors, Primitive* primitives,
                                                   int num_primitives, int n_samples,

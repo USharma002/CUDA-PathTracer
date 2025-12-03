@@ -6,6 +6,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <unordered_set>
 #include <cmath>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -26,6 +27,7 @@
 #include "quad.h"
 #include "scene.h"
 #include "file_manager.h"
+#include "render_config.h"
 #include "integrator.h"
 #include "surface_interaction_record.h"
 #include "form_factors.h"
@@ -34,9 +36,7 @@
 // CONSTANTS & ENUMS
 // ============================================================================
 
-
-#define GRID_RES 20
-#define GRID_SIZE (GRID_RES * GRID_RES)  // Total grid cells
+// Grid configuration is centralized in render_config.h (GRID_RES, GRID_SIZE)
 #define RADIOSITY_HISTORY 10
 
 
@@ -45,14 +45,20 @@ constexpr int   DEFAULT_HEIGHT      = 800;
 constexpr float MOUSE_SENSITIVITY   = 0.25f;
 constexpr float ZOOM_SENSITIVITY    = 0.1f;
 
-enum class IntegratorType { 
-    PathTracing, 
-    Radiosity, 
-    RadiosityDelta,
-    RadiosityHistory  // New option
+enum class IntegratorType {
+    PathTracing,
+    Radiosity
 };
 
 enum class GridVisualizationMode { VisibilityCount, RadiosityDistribution };
+
+// Extended sampling mode enum with histogram options
+enum class HistogramSamplingSource {
+    FORM_FACTOR = 0,    // Sample from form factor grid
+    RADIOSITY = 1,      // Sample from radiosity grid
+    BSDF_WEIGHTED = 2,  // Blend with BSDF sampling
+    MIS = 3             // Multiple Importance Sampling
+};
 
 // ============================================================================
 // CUDA UTILITIES
@@ -136,10 +142,26 @@ struct UIState {
     float* h_grid_data;
     GridVisualizationMode grid_viz_mode;
     
+    // Histogram configuration
+    int grid_resolution;         // Current grid resolution (e.g., 50, 100)
+    int top_k_count;            // How many top cells to show/use (0 = all)
+    HistogramSamplingSource histogram_source;  // Which histogram to sample from
+    bool show_top_k_only;       // Visualize only top-K cells
+    bool visualize_luminance;   // Show luminance instead of RGB for radiosity
+    
+    // Top-K data for current primitive
+    int* top_k_indices;         // Indices of top-K cells
+    float* top_k_values;        // Values of top-K cells
+    int actual_top_k_count;     // Actual count (min of top_k_count and available)
+    
     UIState() : is_dragging(false), show_grid_window(false),
                 last_mouse_x(0.0), last_mouse_y(0.0),
                 hovered_primitive_idx(-1), h_grid_data(nullptr),
-                grid_viz_mode(GridVisualizationMode::VisibilityCount) {}
+                grid_viz_mode(GridVisualizationMode::VisibilityCount),
+                grid_resolution(50), top_k_count(0),
+                histogram_source(HistogramSamplingSource::FORM_FACTOR),
+                show_top_k_only(false), visualize_luminance(true),  // Default to luminance (matches sampling)
+                top_k_indices(nullptr), top_k_values(nullptr), actual_top_k_count(0) {}
     
     void cleanup();
 };
@@ -150,15 +172,28 @@ struct AppConfig {
     IntegratorType current_integrator;
     Vector3f camera_origin, look_at, up;
     SamplingMode sampling_mode;
+    HistogramSamplingSource histogram_source;
     float fov;
     bool convert_quads_to_triangles;
+    int top_k_samples;
+    int current_grid_res;  // NEW: Runtime grid resolution
+    
+    // Grid filtering options (see grid_filter.h)
+    bool enable_grid_filtering;      // Enable/disable bilateral filtering
+    bool use_bilateral_filter;       // true = bilateral, false = gaussian
+    float filter_sigma_spatial;      // Spatial sigma for filtering
+    float filter_sigma_range;        // Range sigma for bilateral filtering
     
     AppConfig() : spp(1), subdivision_step(0), radiosity_step(5),
-                  history_step1(0), history_step2(1),  // ADD THESE
+                  history_step1(0), history_step2(1),
                   current_integrator(IntegratorType::PathTracing),
                   camera_origin(0.5, 3, 8.5), look_at(0, 2.5, 0),
-                  up(0, 1, 0), fov(40.0f), sampling_mode(SAMPLING_BSDF),
-                  convert_quads_to_triangles(false) {}
+                  up(0, 1, 0), fov(40.0f), sampling_mode(SamplingMode::SAMPLING_BSDF),
+                  histogram_source(HistogramSamplingSource::FORM_FACTOR),
+                  convert_quads_to_triangles(false), top_k_samples(0),
+                  current_grid_res(DEFAULT_GRID_RES),
+                  enable_grid_filtering(false), use_bilateral_filter(true),
+                  filter_sigma_spatial(1.5f), filter_sigma_range(0.3f) {}
 };
 
 
@@ -233,20 +268,37 @@ void copyGridData(Primitive* d_prims, int prim_idx, float* h_grid,
         return;
     }
     
+    // Copy primitive from device to host
     Primitive temp_prim;
     cudaMemcpy(&temp_prim, &d_prims[prim_idx], sizeof(Primitive), cudaMemcpyDeviceToHost);
     
+    // IMPORTANT: After copying, we access the grid arrays DIRECTLY from the copied struct
+    // (the grid data is inline in Triangle/Quad, so it's copied with the Primitive)
     if (use_radiosity) {
-        Vector3f* rad_grid = temp_prim.getRadiosityGrid();
-        for (int i = 0; i < GRID_SIZE; i++) {
-            h_grid[i * 3 + 0] = rad_grid[i].x();
-            h_grid[i * 3 + 1] = rad_grid[i].y();
-            h_grid[i * 3 + 2] = rad_grid[i].z();
+        // Access radiosity_grid inline array from the copied struct
+        if (temp_prim.type == PRIM_TRIANGLE) {
+            for (int i = 0; i < GRID_SIZE; i++) {
+                h_grid[i * 3 + 0] = temp_prim.tri.radiosity_grid[i].x();
+                h_grid[i * 3 + 1] = temp_prim.tri.radiosity_grid[i].y();
+                h_grid[i * 3 + 2] = temp_prim.tri.radiosity_grid[i].z();
+            }
+        } else {
+            for (int i = 0; i < GRID_SIZE; i++) {
+                h_grid[i * 3 + 0] = temp_prim.quad.radiosity_grid[i].x();
+                h_grid[i * 3 + 1] = temp_prim.quad.radiosity_grid[i].y();
+                h_grid[i * 3 + 2] = temp_prim.quad.radiosity_grid[i].z();
+            }
         }
     } else {
-        float* grid = temp_prim.getGrid();
-        for (int i = 0; i < GRID_SIZE; i++) {
-            h_grid[i * 3 + 0] = h_grid[i * 3 + 1] = h_grid[i * 3 + 2] = grid[i];
+        // Access grid inline array from the copied struct
+        if (temp_prim.type == PRIM_TRIANGLE) {
+            for (int i = 0; i < GRID_SIZE; i++) {
+                h_grid[i * 3 + 0] = h_grid[i * 3 + 1] = h_grid[i * 3 + 2] = temp_prim.tri.grid[i];
+            }
+        } else {
+            for (int i = 0; i < GRID_SIZE; i++) {
+                h_grid[i * 3 + 0] = h_grid[i * 3 + 1] = h_grid[i * 3 + 2] = temp_prim.quad.grid[i];
+            }
         }
     }
 }
@@ -552,6 +604,17 @@ void RadiosityState::runSolver(Primitive* h_primitives, int num_prims,
             d_radiosity_primitives, d_form_factors, num_prims);
         cudaDeviceSynchronize();
         
+        // Apply grid filtering if enabled (see grid_filter.h)
+        if (g_state.config.enable_grid_filtering) {
+            if (g_state.config.use_bilateral_filter) {
+                filter_radiosity_grids(d_radiosity_primitives, num_prims, GRID_RES,
+                    g_state.config.filter_sigma_spatial, g_state.config.filter_sigma_range);
+            } else {
+                filter_radiosity_grids_gaussian(d_radiosity_primitives, num_prims, GRID_RES,
+                    g_state.config.filter_sigma_spatial);
+            }
+        }
+        
         if ((i + 1) % 5 == 0 || i == 0) {
             std::cout << "  Iteration " << i + 1 << " complete" << std::endl;
         }
@@ -561,7 +624,37 @@ void RadiosityState::runSolver(Primitive* h_primitives, int num_prims,
     // Copy results back
     cudaMemcpy(h_primitives, d_radiosity_primitives, num_prims * sizeof(Primitive), cudaMemcpyDeviceToHost);
     is_calculated = true;
-    std::cout << "========== RADIOSITY COMPLETE ==========\n" << std::endl;
+    
+    // Debug: Check radiosity grid values after solver
+    float max_rad_grid = 0.0f;
+    int non_zero_cells = 0;
+    for (int p = 0; p < std::min(5, num_prims); p++) {
+        float prim_max = 0.0f;
+        int prim_nonzero = 0;
+        if (h_primitives[p].type == PRIM_TRIANGLE) {
+            for (int c = 0; c < GRID_SIZE; c++) {
+                float intensity = h_primitives[p].tri.radiosity_grid[c].x() +
+                                 h_primitives[p].tri.radiosity_grid[c].y() +
+                                 h_primitives[p].tri.radiosity_grid[c].z();
+                if (intensity > 1e-6f) prim_nonzero++;
+                prim_max = fmaxf(prim_max, intensity);
+            }
+        } else {
+            for (int c = 0; c < GRID_SIZE; c++) {
+                float intensity = h_primitives[p].quad.radiosity_grid[c].x() +
+                                 h_primitives[p].quad.radiosity_grid[c].y() +
+                                 h_primitives[p].quad.radiosity_grid[c].z();
+                if (intensity > 1e-6f) prim_nonzero++;
+                prim_max = fmaxf(prim_max, intensity);
+            }
+        }
+        std::cout << "  Prim " << p << " radiosity grid: max=" << prim_max << ", non-zero=" << prim_nonzero << std::endl;
+        max_rad_grid = fmaxf(max_rad_grid, prim_max);
+        non_zero_cells += prim_nonzero;
+    }
+    std::cout << "Overall radiosity grid max: " << max_rad_grid << ", total non-zero: " << non_zero_cells << std::endl;
+    
+    std::cout << "========== RADIOSITY COMPLETE ==========\\n" << std::endl;
 }
 
 void RadiosityState::cleanup() {
@@ -580,7 +673,13 @@ void RadiosityState::cleanup() {
 
 void UIState::cleanup() {
     if (h_grid_data) delete[] h_grid_data;
+    if (top_k_indices) delete[] top_k_indices;
+    if (top_k_values) delete[] top_k_values;
+    
     h_grid_data = nullptr;
+    top_k_indices = nullptr;
+    top_k_values = nullptr;
+    actual_top_k_count = 0;
 }
 
 // ============================================================================
@@ -671,18 +770,12 @@ void renderControlsWindow() {
         g_state.config.sampling_mode = (SamplingMode)current_sampling;
     }
 
-    if (g_state.config.current_integrator == IntegratorType::RadiosityDelta ||
-        g_state.config.current_integrator == IntegratorType::RadiosityHistory) {
-        ImGui::Text("History Visualization:");
-        ImGui::SliderInt("Step 1 (Recent)", &g_state.config.history_step1, 0, RADIOSITY_HISTORY - 1);
-        ImGui::SliderInt("Step 2 (Older)", &g_state.config.history_step2, 0, RADIOSITY_HISTORY - 1);
-        ImGui::Text("Delta: Step %d - Step %d", g_state.config.history_step1, g_state.config.history_step2);
-    }
+    // Radiosity history/delta visualization removed for minimal build
     
-    // Integrator selection
-    const char* integrator_names[] = { "Path Tracing", "Radiosity", "Radiosity Delta", "Radiosity History" };
+    // Integrator selection (minimal: PathTracing or Radiosity)
+    const char* integrator_names[] = { "Path Tracing", "Radiosity" };
     int current_integrator = (int)g_state.config.current_integrator;
-    if (ImGui::Combo("Integrator", &current_integrator, integrator_names, 4)) {  // Changed from 3 to 4
+    if (ImGui::Combo("Integrator", &current_integrator, integrator_names, 2)) {
         g_state.config.current_integrator = (IntegratorType)current_integrator;
     }
 
@@ -693,6 +786,39 @@ void renderControlsWindow() {
     if (g_state.radiosity.use_monte_carlo) {
         ImGui::SliderInt("MC Samples", &g_state.radiosity.mc_samples, 4, 256);
     }
+    
+    // Grid Filtering Controls (see grid_filter.h)
+    ImGui::Separator();
+    ImGui::Text("Grid Filtering:");
+    ImGui::Checkbox("Enable Grid Filtering (during radiosity)", &g_state.config.enable_grid_filtering);
+    if (g_state.config.enable_grid_filtering) {
+        ImGui::Checkbox("Use Bilateral (vs Gaussian)", &g_state.config.use_bilateral_filter);
+        ImGui::SliderFloat("Spatial Sigma", &g_state.config.filter_sigma_spatial, 0.5f, 5.0f);
+        if (g_state.config.use_bilateral_filter) {
+            ImGui::SliderFloat("Range Sigma", &g_state.config.filter_sigma_range, 0.05f, 1.0f);
+        }
+    }
+    
+    // Apply filter now button (applies to currently loaded grids)
+    if (ImGui::Button("Apply Filter Now")) {
+        if (g_state.config.use_bilateral_filter) {
+            filter_radiosity_grids(g_state.scene.d_primitives, g_state.scene.num_primitives, GRID_RES,
+                g_state.config.filter_sigma_spatial, g_state.config.filter_sigma_range);
+        } else {
+            filter_radiosity_grids_gaussian(g_state.scene.d_primitives, g_state.scene.num_primitives, GRID_RES,
+                g_state.config.filter_sigma_spatial);
+        }
+        // Sync back to host for consistency
+        cudaMemcpy(g_state.scene.h_primitives, g_state.scene.d_primitives,
+                  g_state.scene.num_primitives * sizeof(Primitive), cudaMemcpyDeviceToHost);
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Apply bilateral/gaussian filtering to the current radiosity grids.\\n"
+                          "This smooths noise while preserving important directional features.");
+    }
+    ImGui::Separator();
     
     if (ImGui::Button("Calculate Radiosity") || rad_changed) {
         g_state.radiosity.runSolver(g_state.scene.h_primitives, g_state.scene.num_primitives,
@@ -757,15 +883,65 @@ void renderGridWindow() {
     
     ImGui::Begin("Directional Grid", &g_state.ui.show_grid_window);
 
-    const char* modes[] = { "Visibility Count", "Radiosity Distribution" };
-    int current_mode = (int)g_state.ui.grid_viz_mode;
-    if (ImGui::Combo("Mode", &current_mode, modes, 2)) {
-        g_state.ui.grid_viz_mode = (GridVisualizationMode)current_mode;
+    // ===== SAMPLING MODE INFO =====
+    const char* mode_names[] = { "BSDF (cosine)", "Grid (FormFactor)", "MIS (Radiosity+BSDF)" };
+    int mode_idx = (g_state.config.sampling_mode == SamplingMode::SAMPLING_BSDF) ? 0 :
+                   (g_state.config.sampling_mode == SamplingMode::SAMPLING_FORMFACTOR || 
+                    g_state.config.sampling_mode == SamplingMode::SAMPLING_TOPK) ? 1 : 2;
+    ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Current Sampling: %s", mode_names[mode_idx]);
+    
+    // ===== GRID VISUALIZATION MODE =====
+    ImGui::Separator();
+    const char* modes[] = { "Form Factor (Grid/TopK sampling)", "Radiosity Luminance (Radiosity/MIS sampling)" };
+    int current_mode = (g_state.ui.histogram_source == HistogramSamplingSource::RADIOSITY) ? 1 : 0;
+    if (ImGui::Combo("Visualize##viz", &current_mode, modes, 2)) {
+        g_state.ui.histogram_source = (current_mode == 0) ? 
+            HistogramSamplingSource::FORM_FACTOR : HistogramSamplingSource::RADIOSITY;
+        g_state.config.histogram_source = g_state.ui.histogram_source;
+        // Auto-enable luminance mode when switching to radiosity (matches what sampler uses)
+        if (current_mode == 1) {
+            g_state.ui.visualize_luminance = true;
+        }
     }
+    
+    // Show RGB option only for radiosity (for debugging/visualization purposes)
+    if (g_state.ui.histogram_source == HistogramSamplingSource::RADIOSITY) {
+        bool show_rgb = !g_state.ui.visualize_luminance;
+        if (ImGui::Checkbox("Show RGB (debug only, not sampling PDF)", &show_rgb)) {
+            g_state.ui.visualize_luminance = !show_rgb;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Sampling uses LUMINANCE: Y = 0.2126R + 0.7152G + 0.0722B\n"
+                              "Check this to see RGB colors (doesn't match what sampler sees).");
+        }
+    }
+    
+    // ===== GRID RESOLUTION INFO =====
+    ImGui::Separator();
+    ImGui::Text("Grid Configuration:");
+    ImGui::Text("Grid Resolution: %d x %d (fixed at compile time)", GRID_RES, GRID_RES);
+    ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Total cells: %d", GRID_SIZE);
+    
+    // ===== TOP-K SAMPLING CONTROLS =====
+    ImGui::Separator();
+    ImGui::Text("Top-K Sampling:");
+    
+    const char* topk_modes[] = { "Form Factor", "Radiosity Intensity" };
+    int current_topk_mode = (g_state.ui.histogram_source == HistogramSamplingSource::FORM_FACTOR) ? 0 : 1;
+    if (ImGui::Combo("Top-K Source##main", &current_topk_mode, topk_modes, 2)) {
+        g_state.ui.histogram_source = (current_topk_mode == 0) ? 
+            HistogramSamplingSource::FORM_FACTOR : HistogramSamplingSource::RADIOSITY;
+        g_state.config.histogram_source = g_state.ui.histogram_source;
+    }
+    
+    ImGui::Checkbox("Enable Top-K Sampling##grid", &g_state.ui.show_top_k_only);
+    ImGui::SliderInt("Top-K Count##grid", &g_state.ui.top_k_count, 1, 500);
+    g_state.config.top_k_samples = g_state.ui.top_k_count;
     
     if (g_state.ui.hovered_primitive_idx >= 0 && 
         g_state.ui.hovered_primitive_idx < g_state.scene.num_primitives) {
         
+        ImGui::Separator();
         ImGui::Text("Primitive ID: %d", g_state.ui.hovered_primitive_idx);
         
         // Allocate grid data if needed
@@ -773,92 +949,220 @@ void renderGridWindow() {
             g_state.ui.h_grid_data = new float[GRID_RES * GRID_RES * 3];
         }
         
-        bool use_rad = (g_state.ui.grid_viz_mode == GridVisualizationMode::RadiosityDistribution);
+        // Allocate top-K data if needed
+        if (!g_state.ui.top_k_indices && g_state.ui.top_k_count > 0) {
+            g_state.ui.top_k_indices = new int[g_state.ui.top_k_count];
+            g_state.ui.top_k_values = new float[g_state.ui.top_k_count];
+        }
+        
+        // Use histogram_source to determine what to visualize
+        bool use_radiosity_grid = (g_state.ui.histogram_source == HistogramSamplingSource::RADIOSITY);
         copyGridData(g_state.scene.d_primitives, g_state.ui.hovered_primitive_idx,
-                    g_state.ui.h_grid_data, g_state.scene.num_primitives, use_rad);
+                    g_state.ui.h_grid_data, g_state.scene.num_primitives, use_radiosity_grid);
+        
+        // Calculate top-K from the selected grid
+        if (g_state.ui.show_top_k_only && g_state.ui.top_k_count > 0) {
+            Primitive temp_prim;
+            cudaMemcpy(&temp_prim, &g_state.scene.d_primitives[g_state.ui.hovered_primitive_idx], 
+                      sizeof(Primitive), cudaMemcpyDeviceToHost);
+            
+            // For radiosity, we need to compute intensity values first
+            if (use_radiosity_grid) {
+                // Convert RGB radiosity to intensity for top-K calculation
+                std::vector<std::pair<int, float>> intensity_pairs;
+                intensity_pairs.reserve(GRID_SIZE);
+                
+                if (temp_prim.type == PRIM_TRIANGLE) {
+                    for (int i = 0; i < GRID_SIZE; i++) {
+                        float intensity = temp_prim.tri.radiosity_grid[i].x() + 
+                                         temp_prim.tri.radiosity_grid[i].y() + 
+                                         temp_prim.tri.radiosity_grid[i].z();
+                        intensity_pairs.push_back({i, intensity});
+                    }
+                } else {
+                    for (int i = 0; i < GRID_SIZE; i++) {
+                        float intensity = temp_prim.quad.radiosity_grid[i].x() + 
+                                         temp_prim.quad.radiosity_grid[i].y() + 
+                                         temp_prim.quad.radiosity_grid[i].z();
+                        intensity_pairs.push_back({i, intensity});
+                    }
+                }
+                
+                // Sort and extract top-K
+                std::partial_sort(intensity_pairs.begin(), 
+                                 intensity_pairs.begin() + std::min(g_state.ui.top_k_count, (int)intensity_pairs.size()),
+                                 intensity_pairs.end(),
+                                 [](const auto& a, const auto& b) { return a.second > b.second; });
+                
+                g_state.ui.actual_top_k_count = std::min(g_state.ui.top_k_count, (int)intensity_pairs.size());
+                for (int i = 0; i < g_state.ui.actual_top_k_count; i++) {
+                    g_state.ui.top_k_indices[i] = intensity_pairs[i].first;
+                    g_state.ui.top_k_values[i] = intensity_pairs[i].second;
+                }
+            } else {
+                // Use form-factor grid directly
+                temp_prim.getTopKIndices(g_state.ui.top_k_count, g_state.ui.top_k_indices, 
+                                         g_state.ui.top_k_values, g_state.ui.actual_top_k_count);
+            }
+            
+            ImGui::Text("Actual Top-K: %d", g_state.ui.actual_top_k_count);
+            ImGui::Text("Top-K Max Value: %.3f", g_state.ui.actual_top_k_count > 0 ? 
+                                                  g_state.ui.top_k_values[0] : 0.0f);
+        }
         
         // Render heatmap
         ImVec2 size(400, 400);
         ImDrawList* draw_list = ImGui::GetWindowDrawList();
         ImVec2 canvas_pos = ImGui::GetCursorScreenPos();
         
+        // Determine if we should use luminance for visualization (matches sampling PDF)
+        bool show_luminance = use_radiosity_grid && g_state.ui.visualize_luminance;
+        
         // Find max value for normalization
         float max_val = 0.0f;
-        if (use_rad) {
-            // For radiosity, find max across all RGB channels
-            for (int i = 0; i < GRID_RES * GRID_RES; i++) {
-                max_val = fmaxf(max_val, g_state.ui.h_grid_data[i * 3 + 0]);
-                max_val = fmaxf(max_val, g_state.ui.h_grid_data[i * 3 + 1]);
-                max_val = fmaxf(max_val, g_state.ui.h_grid_data[i * 3 + 2]);
-            }
+        if (g_state.ui.show_top_k_only && g_state.ui.actual_top_k_count > 0) {
+            max_val = g_state.ui.top_k_values[0];  // First element is max (sorted)
         } else {
-            // For visibility count, find max of grayscale values
-            for (int i = 0; i < GRID_RES * GRID_RES; i++) {
-                max_val = fmaxf(max_val, g_state.ui.h_grid_data[i * 3]);
+            if (use_radiosity_grid) {
+                for (int i = 0; i < GRID_RES * GRID_RES; i++) {
+                    if (show_luminance) {
+                        // Luminance: Y = 0.2126*R + 0.7152*G + 0.0722*B (ITU-R BT.709)
+                        float lum = 0.2126f * g_state.ui.h_grid_data[i * 3 + 0] +
+                                    0.7152f * g_state.ui.h_grid_data[i * 3 + 1] +
+                                    0.0722f * g_state.ui.h_grid_data[i * 3 + 2];
+                        max_val = fmaxf(max_val, lum);
+                    } else {
+                        max_val = fmaxf(max_val, g_state.ui.h_grid_data[i * 3 + 0]);
+                        max_val = fmaxf(max_val, g_state.ui.h_grid_data[i * 3 + 1]);
+                        max_val = fmaxf(max_val, g_state.ui.h_grid_data[i * 3 + 2]);
+                    }
+                }
+            } else {
+                for (int i = 0; i < GRID_RES * GRID_RES; i++) {
+                    max_val = fmaxf(max_val, g_state.ui.h_grid_data[i * 3]);
+                }
             }
         }
         
-        ImGui::Text("Max Value: %.3f", max_val);
+        ImGui::Text("Max Value: %.6f", max_val);
+        const char* view_mode = use_radiosity_grid ? 
+            (show_luminance ? "Radiosity (Luminance/PDF)" : "Radiosity (RGB)") : "Form Factor Grid";
+        ImGui::Text("Viewing: %s", view_mode);
+        
+        // Debug: show sum of all values to verify data is being read
+        float total_sum = 0.0f;
+        int non_zero_count = 0;
+        for (int i = 0; i < GRID_SIZE; i++) {
+            float val;
+            if (use_radiosity_grid) {
+                if (show_luminance) {
+                    val = 0.2126f * g_state.ui.h_grid_data[i * 3 + 0] +
+                          0.7152f * g_state.ui.h_grid_data[i * 3 + 1] +
+                          0.0722f * g_state.ui.h_grid_data[i * 3 + 2];
+                } else {
+                    val = g_state.ui.h_grid_data[i * 3 + 0] + g_state.ui.h_grid_data[i * 3 + 1] + g_state.ui.h_grid_data[i * 3 + 2];
+                }
+            } else {
+                val = g_state.ui.h_grid_data[i * 3];
+            }
+            total_sum += val;
+            if (val > 1e-6f) non_zero_count++;
+        }
+        ImGui::Text("Total Sum: %.4f | Non-zero cells: %d", total_sum, non_zero_count);
         
         float cell_w = size.x / GRID_RES;
         float cell_h = size.y / GRID_RES;
+        
+        // Create a set of top-K indices for fast lookup (only if needed)
+        std::unordered_set<int> top_k_set;
+        if (g_state.ui.show_top_k_only && g_state.ui.actual_top_k_count > 0) {
+            top_k_set.reserve(g_state.ui.actual_top_k_count);
+            for (int i = 0; i < g_state.ui.actual_top_k_count; i++) {
+                top_k_set.insert(g_state.ui.top_k_indices[i]);
+            }
+        }
         
         for (int theta = 0; theta < GRID_RES; theta++) {
             for (int phi = 0; phi < GRID_RES; phi++) {
                 int idx = theta * GRID_RES + phi;
                 
+                // Skip if showing top-K only and this isn't in top-K
+                if (g_state.ui.show_top_k_only && top_k_set.find(idx) == top_k_set.end()) {
+                    continue;
+                }
+                
                 ImU32 color;
-                if (use_rad) {
-                    // Radiosity: display RGB directly with normalization
+                if (use_radiosity_grid) {
                     float r = g_state.ui.h_grid_data[idx * 3 + 0];
-                    float g = g_state.ui.h_grid_data[idx * 3 + 1];
+                    float g_val = g_state.ui.h_grid_data[idx * 3 + 1];
                     float b = g_state.ui.h_grid_data[idx * 3 + 2];
                     
-                    // Normalize and clamp
-                    if (max_val > 1e-6f) {
-                        r = fminf(r / max_val, 1.0f);
-                        g = fminf(g / max_val, 1.0f);
-                        b = fminf(b / max_val, 1.0f);
+                    if (show_luminance) {
+                        // Luminance mode: use same formula as sampling
+                        float lum = 0.2126f * r + 0.7152f * g_val + 0.0722f * b;
+                        float val = (max_val > 1e-6f) ? fminf(lum / max_val, 1.0f) : 0.0f;
+                        
+                        // Use heatmap colormap for luminance (matches form factor display)
+                        float hr, hg, hb;
+                        if (val < 0.25f) {
+                            hr = val * 4.0f;
+                            hg = 0.0f;
+                            hb = 0.0f;
+                        } else if (val < 0.5f) {
+                            hr = 1.0f;
+                            hg = (val - 0.25f) * 2.0f;
+                            hb = 0.0f;
+                        } else if (val < 0.75f) {
+                            hr = 1.0f;
+                            hg = 0.5f + (val - 0.5f) * 2.0f;
+                            hb = 0.0f;
+                        } else {
+                            hr = 1.0f;
+                            hg = 1.0f;
+                            hb = (val - 0.75f) * 4.0f;
+                        }
+                        color = IM_COL32((int)(hr * 255), (int)(hg * 255), (int)(hb * 255), 255);
+                    } else {
+                        // RGB mode: display actual radiosity colors
+                        if (max_val > 1e-6f) {
+                            r = fminf(r / max_val, 1.0f);
+                            g_val = fminf(g_val / max_val, 1.0f);
+                            b = fminf(b / max_val, 1.0f);
+                        }
+                        
+                        r = sqrtf(r);
+                        g_val = sqrtf(g_val);
+                        b = sqrtf(b);
+                        
+                        color = IM_COL32((int)(r * 255), (int)(g_val * 255), (int)(b * 255), 255);
                     }
-                    
-                    // Apply gamma correction for better visibility
-                    r = powf(r, 0.5f);
-                    g = powf(g, 0.5f);
-                    b = powf(b, 0.5f);
-                    
-                    color = IM_COL32((int)(r * 255), (int)(g * 255), (int)(b * 255), 255);
                 } else {
-                    // Visibility count: use hot colormap (black -> red -> orange -> yellow -> white)
                     float val = g_state.ui.h_grid_data[idx * 3];
                     if (max_val > 1e-6f) {
                         val = fminf(val / max_val, 1.0f);
                     }
                     
-                    // Hot colormap
-                    float r, g, b;
+                    // Hot colormap (optimized)
+                    float r, g_val, b;
                     if (val < 0.25f) {
-                        // Black to dark red
-                        r = val / 0.25f;
-                        g = 0.0f;
+                        r = val * 4.0f;
+                        g_val = 0.0f;
                         b = 0.0f;
                     } else if (val < 0.5f) {
-                        // Dark red to bright red
                         r = 1.0f;
-                        g = (val - 0.25f) / 0.25f * 0.5f;
+                        g_val = (val - 0.25f) * 2.0f;
                         b = 0.0f;
                     } else if (val < 0.75f) {
-                        // Bright red to orange/yellow
                         r = 1.0f;
-                        g = 0.5f + (val - 0.5f) / 0.25f * 0.5f;
+                        g_val = 0.5f + (val - 0.5f) * 2.0f;
                         b = 0.0f;
                     } else {
-                        // Yellow to white
                         r = 1.0f;
-                        g = 1.0f;
-                        b = (val - 0.75f) / 0.25f;
+                        g_val = 1.0f;
+                        b = (val - 0.75f) * 4.0f;
                     }
                     
-                    color = IM_COL32((int)(r * 255), (int)(g * 255), (int)(b * 255), 255);
+                    color = IM_COL32((int)(r * 255), (int)(g_val * 255), (int)(b * 255), 255);
                 }
                 
                 ImVec2 p_min(canvas_pos.x + phi * cell_w, canvas_pos.y + theta * cell_h);
@@ -871,10 +1175,14 @@ void renderGridWindow() {
         // Add a legend/colorbar
         ImGui::Dummy(size);
         
-        if (!use_rad) {
-            ImGui::Text("Colormap: Black -> Red -> Orange -> Yellow -> White");
+        if (use_radiosity_grid) {
+            if (show_luminance) {
+                ImGui::Text("Colormap: Luminance heatmap (matches sampling PDF)");
+            } else {
+                ImGui::Text("Colormap: RGB Radiosity (normalized, gamma corrected)");
+            }
         } else {
-            ImGui::Text("Colormap: RGB Radiosity (normalized)");
+            ImGui::Text("Colormap: Black -> Red -> Orange -> Yellow -> White");
         }
         
     } else {
@@ -896,39 +1204,11 @@ void renderFrame() {
                 g_state.render.d_image, g_state.render.d_camera, g_state.scene.d_scene,
                 g_state.render.d_rand_state, g_state.config.spp, g_state.config.sampling_mode);
             break;
-            
+
         case IntegratorType::Radiosity:
             render_radiosity<<<g_state.render.grid, g_state.render.block>>>(
                 g_state.render.d_image, g_state.render.d_camera, g_state.scene.d_scene,
                 g_state.render.d_rand_state, g_state.config.spp);
-            break;
-            
-        case IntegratorType::RadiosityDelta:
-            if (g_state.radiosity.is_calculated) {
-                // Call the delta integrator with history parameters
-                radiosity_delta_integrator<<<g_state.render.grid, g_state.render.block>>>(
-                    g_state.render.d_image, 
-                    g_state.render.width, 
-                    g_state.render.height,
-                    g_state.render.d_camera, 
-                    g_state.scene.d_scene, 
-                    g_state.config.history_step1,  // Pass history step 1
-                    g_state.config.history_step2); // Pass history step 2
-            }
-            break;
-            
-        case IntegratorType::RadiosityHistory:
-            // You can implement a different visualization for this mode
-            if (g_state.radiosity.is_calculated) {
-                radiosity_delta_integrator<<<g_state.render.grid, g_state.render.block>>>(
-                    g_state.render.d_image, 
-                    g_state.render.width, 
-                    g_state.render.height,
-                    g_state.render.d_camera, 
-                    g_state.scene.d_scene, 
-                    g_state.config.history_step1,  // Pass history step 1
-                    g_state.config.history_step2); // Pass history step 2
-            }
             break;
     }
     

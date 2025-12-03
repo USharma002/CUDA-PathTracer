@@ -4,13 +4,10 @@
 #include "vector.h"
 #include "ray.h"
 #include "surface_interaction_record.h"
-
-#ifndef GRID_SIZE
-#define GRID_SIZE 400  // 100x100 default
-#endif
+#include "render_config.h"
 
 #ifndef RADIOSITY_HISTORY
-#define RADIOSITY_HISTORY 10  // 100x100 default
+#define RADIOSITY_HISTORY 10
 #endif
 
 class Triangle {
